@@ -1,15 +1,20 @@
-name = "AutomaticMusicTranscription"
+name = "PolyphonicSignals"
 uuid = "d36314a0-77c6-484e-b2e7-c3adb10a7433"
 authors = ["Eli Smith"]
 version = "0.1.0"
 
 [deps]
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Clustering = "aaaa29a8-35af-508c-8bc3-b662a17a0fe5"
 DSP = "717857b8-e6f2-59f4-9121-6e50c889abd2"
 DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+FourierTools = "b18b359b-aebc-45ac-a139-9c0ccbb2871e"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LowRankApprox = "898213cb-b102-5a47-900c-97e73b919f73"
 Memoize = "c03570c3-d221-55d1-a50c-7939bbd78826"
+MultivariateStats = "6f286f6a-111f-5878-ab1e-185364afe411"
 Peaks = "18e31ff7-3703-566c-8e60-38913d67486b"
 Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
 RollingFunctions = "b0e4dd01-7b14-53d8-9b45-175a3e362653"

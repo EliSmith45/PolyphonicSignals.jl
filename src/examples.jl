@@ -1,29 +1,13 @@
+using CairoMakie
+cd("AutomaticMusicTranscription")
+
+
 using Revise
 
-#=
-using WAV
-using DSP
-using FFTW #fast fourier transform backend
-using Peaks
-using Distributions
-using Statistics
-using StatsBase
-using DataStructures
-using RollingFunctions
-using Memoize
-using CairoMakie
-=#
 
 
-includet("./timeFreqDists.jl")
-
-
-using .timeFrequencyAnalysis
-using .TQWT
-using .MorphologicalComponents
-
-
-### testing out some basic TFD visualization functionsfr = createEnvelope([200, 300, 400, 600],  [10, -10, 10, -10], 20, 2, 20000)
+using AutomaticMusicTranscription
+### testing out some basic TFD visualization functions 
 
 
 fr = createEnvelope([200, 300, 400, 600],  [10, -10, 10, -10], 20, 2, 20000)
@@ -40,21 +24,6 @@ spec = audioRecord([hzToErb.(frs) frs], transpose(mag), round(1/(times[4]-times[
 plotSpectrogram(spec, tmin = 0, tmax = 1.8, fmin = 0, fmax = 1000, zScale = "linear", logY = false)
 plotDFT(mag, frs, times, .1, 1000)
 
-
-### testing the gammatone filter bank
-gammatoneFB = create_gt_cascade_filterBank(40, 1000, song.fs, 100, .2)
-plotFB(gammatoneFB, -200, 0, 200, 2000, song.fs)
-
-spectra = applyFilterbank(song, gammatoneFB)
-audioSplit = get_inst_power_exponential(spectra, .99)
-plotSpectrogram(audioSplit, tmin = 0, tmax = 1, fmin = 0, fmax = 1000, zScale = "linear", logY = false)
-
-gtSpectrum = get_inst_power_exponential(audioSplit, .5)
-gtAveSpec = windowAverages(gtSpectrum, 200, 10)
-spectraPeaks = amp_from_windowPeaks(spectra, 500, 497)
-plotSpectrogram(gtSpectrum, tmin = 0, tmax = audioSplit.duration, fmin = 0, fmax = 1000, zScale = "linear", logY = false)
-plotSpectrogram(gtAveSpec, tmin = 0, tmax = gtAveSpec.duration, fmin = 0, fmax = 1000, zScale = "linear", logY = false)
-plotSpectrogram(spectraPeaks, tmin = 0, tmax = spectraPeaks.duration, fmin = spectraPeaks.cfs[1,2], fmax = 1000, zScale = "linear", logY = false)
 
 
 ### testing the Meddis IHC model####### Hair cell model #######
@@ -87,7 +56,7 @@ plotStrandBook(strandBook, spectraPeaks; tmin = 0, tmax = spectraPeaks.duration,
 
 
 ### synchrony strands with a real song
-song = getSongMono("audioProcessing/porterRobinson_shelter.wav", 0, 20)
+song = getSongMono("./porterRobinson_shelter.wav", 0, 20)
 plotAudio(song, 1, 0, .5)
 midEarHighPass!(song, .95)
 gammatoneFB = create_gt_cascade_filterBank(10, 2000, song.fs, 200, .25)
@@ -223,3 +192,8 @@ plotSpectrogram(harmonic, tmin = 0, tmax = harmonic.duration, fmax = 1200, ftick
 percussive = applyFilterbank(transient, gammatoneFB)
 percussive = amp_from_windowPeaks(percussive, 1000, 500)
 plotSpectrogram(percussive, tmin = 0, tmax = percussive.duration, fmax = 1200, fticks = 10, tticks = 10, zScale = "linear", logY = false)
+
+
+
+
+

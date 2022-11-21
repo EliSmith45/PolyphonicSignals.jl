@@ -1,8 +1,8 @@
 
 
-module timeFrequencyAnalysis
+module TimeFrequencyTools
 
-using WAV, DSP, FFTW #fast fourier transform backend
+using WAV, DSP, FFTW, LinearAlgebra 
 using Peaks, Distributions, Statistics, StatsBase, RollingFunctions
 using DataStructures, Memoize
 using CairoMakie
@@ -14,7 +14,7 @@ using Revise
 export getSongMono, compress_max!, downsample, clipAudio, createSignalFromInstFA, sampleCosine, createEnvelope, midEarHighPass!
 
 
-getSongMono = function(fname, sTime, eTime)
+function getSongMono(fname, sTime, eTime)
 
     song, fs = wavread(fname)
     s_start = Int(sTime * fs) + 1
@@ -26,7 +26,7 @@ getSongMono = function(fname, sTime, eTime)
 
 end
 
-compress_max! = function(aud, minMult, maxMult)
+function compress_max!(aud, minMult, maxMult)
     zmax = maximum(aud.channels) * maxMult
     zmin = minimum(aud.channels) * minMult
 
@@ -39,20 +39,30 @@ compress_max! = function(aud, minMult, maxMult)
 
 end
 
-downsample = function(audio, new_fs)
+function downsample(audio, newFs, lowpass = true)
     
-    rs1 = DSP.resample(audio.channels[:, 1], new_fs / audio.fs)
-    rs = zeros(Float64, length(rs1), size(audio.channels, 2,))
-    rs[:, 1] = rs1
 
-    Threads.@threads for j in 2:size(audio.channels, 2)
-        rs[:, j] = resample(audio.channels[:, j], new_fs / audio.fs)
+    if lowpass
+
+        rs1 = DSP.resample(@view(audio.channels[:, 1]), newFs / audio.fs)
+        rs = zeros(eltype(audio.channels), length(rs1), size(audio.channels, 2,))
+        rs[:, 1] .= rs1
+
+        Threads.@threads for j in 2:size(audio.channels, 2)
+            rs[:, j] .= resample(@view(audio.channels[:, j]), newFs / audio.fs)
+        end
+
+    else
+        factor = Int(ceil(audio.fs / newFs))
+
+        rs = @view(audio.channels[1:factor:end, :])
+        newFs = audio.fs / factor
     end
 
-    return audioRecord(audio.cfs, rs, new_fs, audio.duration, 1)
+    return audioRecord(audio.cfs, rs, newFs, size(rs, 1) / newFs, audio.nchannels)
 end
 
-clipAudio = function(aud, sTime, eTime)
+function clipAudio(aud, sTime, eTime)
     song = aud.channels
     fs = aud.fs
     s_start = Int(round(sTime * fs)) + 1
@@ -63,7 +73,7 @@ clipAudio = function(aud, sTime, eTime)
     return audioRecord(aud.cfs, song, fs, round(length(song)/fs, digits = 3), aud.nchannels)
 end
 
-exp_sawtooth_envelope = function(len, decay, period)
+function exp_sawtooth_envelope(len, decay, period)
     env = ones(Float64, len)
     for i in 2:len
     
@@ -78,7 +88,7 @@ exp_sawtooth_envelope = function(len, decay, period)
     return env
 end
 
-createSignalFromInstFA= function(frequencies, amplitudes, fs)
+function createSignalFromInstFA(frequencies, amplitudes, fs)
 
     song = sampleCosine(frequencies, amplitudes, fs)
     s = audioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
@@ -86,7 +96,7 @@ createSignalFromInstFA= function(frequencies, amplitudes, fs)
     return s
 end
 
-sampleCosine = function(frequencies, amplitudes, fs)
+function sampleCosine(frequencies, amplitudes, fs)
     song = zeros(size(frequencies, 1))
 
     for j in axes(frequencies, 2)
@@ -97,7 +107,7 @@ sampleCosine = function(frequencies, amplitudes, fs)
 
     return song
 end
-createEnvelope = function(InstVals, linModRate, errorRate, duration, fs)
+function createEnvelope(InstVals, linModRate, errorRate, duration, fs)
     envelope = zeros(Int(round(duration*fs)), length(InstVals))
     
     #linModRate ./= fs #change from inverse seconds to inverse samples
@@ -106,7 +116,7 @@ createEnvelope = function(InstVals, linModRate, errorRate, duration, fs)
     for j in eachindex(InstVals)
         ef = cumsum(rand(Normal(0, errorRate), size(envelope, 1)))
         linMod = cumsum(repeat([linModRate[j]/fs], inner =length(ef)))
-        envelope[:, j] .= repeat([InstVals[j]], inner = length(ef)) .+ linMod .+ ef
+        @view(envelope[:, j]) .= repeat([InstVals[j]], inner = length(ef)) .+ linMod .+ ef
     end
 
     return envelope
@@ -119,9 +129,9 @@ function midEarHighPass!(aud, alpha)
 end
 
 #time-frequency distributions
-export getSTFT, getPowerSpectrum, amp_from_windowPeaks, get_inst_power_exponential, get_hilbert_amp
+export getSTFT, getPowerSpectrum, freq_reassignment_direction
 
-getSTFT = function(songMono, winLen, ovlp, interp, fs)
+function getSTFT(songMono, winLen, ovlp, interp, fs)
     
     complexSTFT = stft(songMono,  
                     winLen, 
@@ -142,7 +152,7 @@ getSTFT = function(songMono, winLen, ovlp, interp, fs)
     return complexSTFT, freqs, times
 end 
 
-getPowerSpectrum = function(complexSTFT)
+function getPowerSpectrum(complexSTFT)
 
     mag = Matrix{Float64}(undef, size(complexSTFT, 1),  size(complexSTFT, 2))
 
@@ -155,73 +165,46 @@ getPowerSpectrum = function(complexSTFT)
     return mag
 end
 
-amp_from_windowPeaks = function(aud, wl, ovlp)
-    channels = zeros(Float64, length(arraysplit(collect(1:size(aud.channels, 1)), wl, ovlp)), aud.nchannels)
 
-    Threads.@threads for j in axes(channels, 2)
-        window = arraysplit(@view(aud.channels[:, j]), wl, ovlp)
+function freq_reassignment_direction(ifreq)
+
+    reassignment = downsample(ifreq, ifreq.fs)
     
-        for (i, wind) in enumerate(window)
-            wind_ave = mean(findmaxima(wind)[2])
-            if isnan(wind_ave)
-                wind_ave = 0.0
-            end
-            channels[i, j] = wind_ave
+    Threads.@threads for j in axes(reassignment.channels, 2)
+        for i in axes(reassignment.channels, 1)
+            reassignment.channels[i, j] = (ifreq.cfs[j, 2] - ifreq.channels[i, j])/mean([ifreq.cfs[j, 2], ifreq.channels[i, j], 1*10^-14])
         end
+        
     end
-    fsNew = aud.fs/(wl - ovlp)
-    dNew = size(channels, 1) / fsNew
-    return audioRecord(aud.cfs, channels, fsNew, dNew, aud.nchannels)
+
+    return reassignment
 end
 
-get_inst_power_exponential = function(aud, alpha)
+import LinearAlgebra.dot
 
-    #inst_amp = zeros(Float64, size(aud.channels))
-    inst_amp = copy(aud.channels)
-    
-    Threads.@threads for j in axes(inst_amp, 2)
-    
-        for i in axes(inst_amp, 1)
-            if i==1
-                inst_amp[1, j] = abs(inst_amp[1, j])
-            else
-                inst_amp[i, j] = alpha*inst_amp[i-1, j] + (1-alpha)*abs(inst_amp[i, j])
-            end
+export envelope_AC_DC, windowedSignal
+
+function envelope_AC_DC(tfd, wl, step)
+    nWindows = Int(div(size(tfd, 1) - wl, step))
+    AC = zeros(Float64, nWindows, size(tfd, 2))
+    DC = zeros(Float64, nWindows, size(tfd, 2))
+
+    Threads.@threads for k in axes(AC, 2)
+        for t in axes(AC, 1)
+            DC[t, k] = mean(@view(tfd[((t - 1)*step + 1):((t - 1)*step + wl), k]))
+            AC[t, k] = std(@view(tfd[((t - 1)*step + 1):((t - 1)*step + wl), k]))
         end
     end
 
-    
-
-    return audioRecord(aud.cfs, inst_amp, aud.fs, aud.duration, aud.nchannels) #, audioRecord(aud.cfs, inst_amp, aud.fs, aud.duration, aud.nchannels)
-
+    return AC, DC
 end
 
-get_hilbert_amp = function(aud; lowpass = false, cutoff = 500, bwOrder = 4)
-
-    inst_amp = zeros(Float64, size(aud.channels, 1),  size(aud.channels, 2))
-    #inst_freq = zeros(Float64, size(aud.channels, 1),  size(aud.channels, 2))
-    
-    responsetype = Lowpass(cutoff; fs=aud.fs)
-    designmethod = Butterworth(bwOrder)
-
-    Threads.@threads for j in axes(inst_amp, 2)
-        x = hilbert(@view(aud.channels[:, j]))
-        for i in eachindex(x)
-            inst_amp[i, j] = sqrt(x[i] * conj(x[i]))
-        end
-
-        if lowpass
-            inst_amp[:, j] = filt(digitalfilter(responsetype, designmethod), inst_amp[:, j])
-            #inst_amp[:, j] = filt(digitalfilter(responsetype, designmethod), inst_amp[:, j])
-            #inst_freq[:, j] = filt(digitalfilter(responsetype, designmethod), inst_freq[:, j])
-        end
-    end
-    
-
-    return audioRecord(aud.cfs, inst_amp, aud.fs, aud.duration, aud.nchannels) #, audioRecord(aud.cfs, inst_amp, aud.fs, aud.duration, aud.nchannels)
+function windowedSignal(aud, tfdNew, step)
+    fsNew = aud.fs/step
+    dNew = size(tfdNew, 1) / fsNew
+    return audioRecord(aud.cfs, tfdNew, fsNew, dNew, aud.nchannels)
 
 end
-
 
 #synchrony strands
 export getPeakList, connectStrands
@@ -367,204 +350,8 @@ end
 
 
 
-
-### gammatone filter banks
-#bandwidth values
-#coefficients from https://www.scinapse.io/papers/396690109#fullText
-
-export create_gt_cascade_filterBank, applyFilterbank, meddis_IHC
-export hzToErb, erbWidth, erbToHz, getErbBins
-
-erbWidth = function(f)
-    erb = 24.7 * ((4.37 * f / 1000) + 1)
-    return erb
-end
-
-hzToErb = function(f)
-    erb = 21.4 * log10((4.37 * f / 1000) + 1)
-    return erb
-end
-
-erbToHz = function(erb)
-    f = (10 ^ (erb / 21.4) - 1) * 1000 / 4.37 
-    return f
-end
-
-getErbBins = function(fmin, fmax, bins)
-    
-    erbBins = LinRange(hzToErb(fmin), hzToErb(fmax), bins)
-    hzBins = erbToHz.(erbBins)
-    freqs = [erbBins hzBins]
-
-    return freqs
-end
-
-getGT_transferFunc = function(params, bandwidth)
-    
-    cf = params.cf
-    T = params.T
-    order = params.order
-    erbModel = params.erbModel
-
-
-    if erbModel == "Glasberg"
-        B = 2*pi*bandwidth*24.7*(4.37*cf/1000 + 1)
-    end
-    
-    
-    b0 = T
-    b2 = 0.0
-
-    
-    if order == 1
-        b1 = -(2*T*cos(2*cf*pi*T)/exp(B*T) + 2*sqrt(3 + 2^(3/2))*T*sin(2*cf*pi*T)/exp(B*T))/2
-    elseif order == 2
-        b1 = -(2*T*cos(2*cf*pi*T)/exp(B*T) - 2*sqrt(3 + 2^(3/2))*T*sin(2*cf*pi*T)/exp(B*T))/2
-    elseif order == 3
-        b1 = -(2*T*cos(2*cf*pi*T)/exp(B*T) + 2*sqrt(3 - 2^(3/2))*T*sin(2*cf*pi*T)/exp(B*T))/2
-    elseif order == 4
-        b1 = -(2*T*cos(2*cf*pi*T)/exp(B*T) - 2*sqrt(3 - 2^(3/2))*T*sin(2*cf*pi*T)/exp(B*T))/2
-    else 
-        print("Order greater than 4 not defined!")
-    end
-
-    a1 = -2*cos(2*cf*pi*T)/exp(B*T)
-    a2 = exp(-2*B*T)
-
-    coefs = (b0, b1, b2, a1, a2)
-    return coefs
-end
-
-get_4thOrder_gammatone = function(cf, fs, bandwidth)
-    
-
-    transFun = getGT_transferFunc(biquadParams(cf, 1/fs, 1, "Glasberg"), bandwidth)
-    filt1 =  Biquad(transFun...)
-
-
-    transFun = getGT_transferFunc(biquadParams(cf, 1/fs, 2, "Glasberg"), bandwidth)
-    filt2 =  Biquad(transFun...)
-
-    transFun = getGT_transferFunc(biquadParams(cf, 1/fs, 3, "Glasberg"), bandwidth)
-    filt3 = Biquad(transFun...)
-
-
-    transFun = getGT_transferFunc(biquadParams(cf, 1/fs, 4, "Glasberg"), bandwidth)
-    filt4 = Biquad(transFun...)
-
-
-# o2 = freqresp(SecondOrderSections([filt1, filt2, filt3, filt4], 1), cf*2*π/fs)
-
-    o2 = freqresp(SecondOrderSections([filt1, filt2, filt3, filt4], 1), cf * 2 * pi / fs)
-    peakGain = convert.(Float64, sqrt.(o2 .* conj.(o2)))
-    
-    
-    
-
-    return SecondOrderSections([filt1, filt2, filt3, filt4], 1/peakGain)
-
-end
-
-create_gt_cascade_filterBank = function(fmin, fmax, fs, bins, bandwidth)
-    freqBins = getErbBins(fmin, fmax, bins)
-    filts = Vector{SecondOrderSections{:z, Float64, Float64}}(undef, bins)
-    
-    
-    for i in axes(freqBins, 1)
-        filts[i] = get_4thOrder_gammatone(freqBins[i, 2], fs, bandwidth)
-    
-    end
-
-    fb = gt_cascaded_filterbank(freqBins, filts)
-    return fb
-end
-
-applyFilterbank = function(s, fb)
-    newNumChannels = size(fb.cfs, 1)
-    splitAudio = Matrix{Float64}(undef, size(s.channels, 1), newNumChannels)
-    Threads.@threads for j in axes(splitAudio, 2)
-        x = DSP.filt(fb.filters[j], s.channels)
-        splitAudio[:, j] = x
-    end
-
-    return audioRecord(fb.cfs, splitAudio, s.fs, s.duration, newNumChannels)
-end
-
-#meddis inner hair cell model
-meddis_IHC = function(aud;
-    m, #maximum storage of transmitter pool
-    a, #permeability average firing rate
-    b, #permeability firing rate compressor
-    g, #permeability scale
-    y, #factory production rate
-    l, #cleft loss rate
-    r, #cleft reprocessing rate
-    x, #store release rate
-    h #firing rate scale
-    )
-
-    dt=1/aud.fs #time step
-    sTime = 0
-    eTime = aud.duration + sTime - dt
-    times = sTime:dt:eTime
-
-
-
-    Cs = zeros(Float64, length(times),  aud.nchannels) 
-    Qt = zeros(Float64, aud.nchannels) 
-    Wt = zeros(Float64, aud.nchannels) 
-    
-
-    #initialize state vars to spontaneous rates
-    kt = g*a/(a+b) #cleft permeability
-    Cs[1, :] .= m*y*kt/(l*kt + y*(l+r))
-    Qt = Cs[1, :] .*(l+r)/kt
-    Wt = Cs[1, :].*(r/x)
-    #go from rates per second to rates per time step
-    g*=dt
-    y*=dt
-    l*=dt
-    r*=dt
-    x*=dt
-    h*=dt
-
-
-
-
-    replenish=0.0
-    reuptake=0.0
-    reprocess=0.0
-    eject=0.0
-
-    for ch in 1:aud.nchannels
-        for t in 2:size(Cs, 1)
-        
-            st = aud.channels[t, ch]
-            kt = ((st + a) > 0) ? g*(st + a)/(st + a + b) : 0.0
-            
-            
-            replenish = (m >= Qt[ch] ) ? y*(m-Qt[ch] ) : 0.0
-        
-            eject=kt*Qt[ch] 
-            loss=l* Cs[t-1, ch] 
-            reuptake=r*Cs[t-1, ch] 
-            reprocess=x*Wt[ch] 
-
-            Cs[t, ch] =  Cs[t-1, ch] + (eject-loss-reuptake)
-            Qt[ch] += (replenish-eject+reprocess)
-            Wt[ch] += (reuptake-reprocess)
-
-        end
-    end
-            
-
-    return Cs
-end
-
-
 ### visualization functions
-export plotSpectrogram, plotAudio
-export plotDFT, plotFB, plotStrandBook
+export plotSpectrogram, plotAudio, plotDFT, plotFB, plotStrandBook
 
 
 function plotSpectrogram(aud; 
@@ -572,32 +359,37 @@ function plotSpectrogram(aud;
     tmax, 
     fmin = aud.cfs[1, 2], 
     fmax = aud.cfs[end, 2], 
+    maxbins = 500,
     fticks = 10,
     tticks = 10,
     zScale,  
     logY = false, 
     showNotes = false)
     
-    if aud.fs > 500
-        aud = downsample(aud, 500)
+    if size(aud.channels, 1) > maxbins
+        newFs = aud.fs / ceil(size(aud.channels, 1) / maxbins)
+        aud = downsample(aud, newFs, false)
+        if tmax > aud.duration
+            tmax = aud.duration
+        end
     end
 
-    
+   
     frs = aud.cfs[:, 2]
     tms = collect(1:size(aud.channels, 1)) ./ aud.fs
-    
-    
-
-    
-
+ 
     fRes = frs[3]-frs[2]
     tRes = tms[3]-tms[2]
 
-    frs = [frs ; fRes+frs[end]]
-    tms = [tms ; tRes+tms[end]]
+    #frs = [frs ; fRes+frs[end]]
+    append!(frs, fRes+frs[end])
+    append!(tms, tRes+tms[end])
+    #tms = [tms ; tRes+tms[end]]
     #append!(Vector(frs), [frs[end] + fRes])
     #append!(Vector(tms), [tms[end] + tRes])
-    
+   
+  
+
 
     f = Figure(backgroundcolor = :white, resolution = (1100, 700))
     if logY
@@ -630,6 +422,8 @@ function plotSpectrogram(aud;
         Colorbar(f[:, 2], colormap = cgrad(:haline, 20))
 
     end
+
+
     ylims!(fmin, fmax)
     xlims!(tmin, tmax)
     f
@@ -676,7 +470,7 @@ function plotFB(fb, ampmin, fmin, fmax, numFreqs, fs)
 
     for filt in fb.filters
         H = freqresp(filt, frs .* (2*pi/fs))
-        hmag = 20 * log.(convert.(Float64, sqrt.(H .* conj.(H))))
+        hmag = 20 * log.(convert.(Float32, sqrt.(H .* conj.(H))))
         keepAmp = findall(x -> x >= ampmin, hmag)
         #keepFreq = findall(x -> x <= fmax && x >= fmin, W)
         #keep = findall(x -> (x in keepAmp) && ( x in keepFreq), 1:length(hmag))
@@ -768,46 +562,106 @@ end
 
 
 ### utility functions
-export getAngle, windowAverages
+export getAngle, windowAverages, mag, get_phase_shift, ifreq, mean_ifreq, norm_cols
 
+function windowAverages(aud, wgt, wl, ovlp)
+    
+    channels = zeros(eltype(aud), length(arraysplit(collect(1:size(aud, 1)), wl, ovlp)), size(aud, 2))
+
+    if isnothing(wgt)
+        Threads.@threads for j in axes(channels, 2)
+            window = arraysplit(1:size(aud, 1), wl, ovlp)
+    
+            for (i, wind) in enumerate(window)
+                channels[i, j] = mean(@view(aud[Int.(wind), j]))
+            end
+        end
+    else
+
+        Threads.@threads for j in axes(channels, 2)
+            window = arraysplit(1:size(aud, 1), wl, ovlp)
+    
+            for (i, wind) in enumerate(window)
+                channels[i, j] = mean(@view(aud[Int.(wind), j]), weights(@view(wgt[Int.(wind), j])))
+            end
+        end
+    end
+    
+   
+    return channels
+end
+
+
+#phase angle of complex value
 function getAngle(m1, m2)
     θ = atan((m1-m2) / (1 + m1*m2))
 end
 
-function windowAverages(aud, wl, ovlp)
-    channels = zeros(Float64, length(arraysplit(collect(1:size(aud.channels, 1)), wl, ovlp)), aud.nchannels)
-
-    Threads.@threads for j in axes(channels, 2)
-        window = arraysplit(@view(aud.channels[:, j]), wl, ovlp)
-    
-        for (i, wind) in enumerate(window)
-            channels[i, j] = mean(wind)
-        end
-    end
-    fsNew = aud.fs/(wl - ovlp)
-    dNew = size(channels, 1) / fsNew
-    return audioRecord(aud.cfs, channels, fsNew, dNew, aud.nchannels)
+#magnitude of complex value
+function mag(a)
+    sqrt(real(a)^2 + imag(a)^2)
 end
+
+
+function get_phase_shift(x1, x2)
+    x1p = transpose(x1 .^ (-1))
+    em = x2 * x1p
+    diags = div(size(em, 1) + size(em, 2) - 2, 2)
+    
+    for i in -diags:diags
+        em[diagind(em, i)] .= mean(diag(em, i))
+    end
+
+    em ./= size(em, 2)
+    return em
+end
+
+
+
+#Uses phase derivative to estimate instantaneous frequency of a sampled complex exponential. 
+#No phase unwrapping is required.
+function ifreq(x, fs)
+    y = x ./ mag.(x)
+    freqs = zeros(Float32, size(y, 1))
+    
+    Threads.@threads for i in 2:(size(y, 1) - 1)
+        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
+    end
+
+    freqs[1] = freqs[2]
+    freqs[end] = freqs[end - 1]
+
+    return freqs
+end
+
+#slightly more efficient if just the mean instantaneous frequency for the sample is needed
+function mean_ifreq(x, fs, len)
+    x ./= mag.(x)
+    freqs = 0.0
+    
+    for i in 2:(size(x, 1) - 1)
+        freqs += (fs * imag(conj(x[i]) * .5 * (x[i + 1] - x[i - 1])) / ((len - 2) * 2 * π)) 
+    end
+
+    return freqs
+end
+
+
+#normalize columns of matrix
+function norm_cols(x, p = 2)
+    y = copy(x)
+    for j in axes(y, 2)
+        y[:, j] = normalize!(y[:, j], p)
+    end
+    return y
+end
+
+
 
 
 ### filterbank related data structures
-export gt_cascaded_filterbank, audioRecord, audStrand
+export audioRecord, audStrand
 
-mutable struct biquadParams
-
-    cf::Float64
-    T::Float64
-    order::Int64
-    erbModel::String
-    
-end
-
-mutable struct gt_cascaded_filterbank
-
-    cfs::Matrix{Float64}
-    filters::Vector{SecondOrderSections{:z, Float64, Float64}}
-    
-end
 
 mutable struct audioRecord
     cfs::Matrix{Float64}
@@ -828,5 +682,12 @@ mutable struct audStrand
 end
 
 
+#=
+function copy(aud::audioRecord)
+    
+    return audioRecord(copy(aud.cfs), copy(inst_amp), copy(aud.fs), copy(aud.duration), copy(aud.nchannels)) 
+
+end
+=#
 
 end
