@@ -1,12 +1,12 @@
 using CairoMakie
-cd("AutomaticMusicTranscription")
+cd("PolyphonicSignals")
 
 
 using Revise
 
 
 
-using AutomaticMusicTranscription
+#using AutomaticMusicTranscription
 ### testing out some basic TFD visualization functions 
 
 

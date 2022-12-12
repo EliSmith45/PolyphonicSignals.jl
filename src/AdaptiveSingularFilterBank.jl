@@ -73,629 +73,853 @@
 #BLAS/LAPACK matrix operations from the LinearAlgebra package.
 
 module AdaptiveSingularFilterBank
-using DSP, StatsBase, LinearAlgebra, Peaks, Clustering, RollingFunctions, LowRankApprox
+using DSP, StatsBase, LinearAlgebra, Peaks, RollingFunctions, LowRankApprox, Revise
 
 include("./TimeFrequencyTools.jl")
-using ..TimeFrequencyTools
-
-
-
-
-
-function ifreq_envelope(signal, cfs, fs, threshold, nn_oneside, sigma)
-    amps = mag.(signal)
-    signal ./= (eps() .+ amps)
-    ifrs = zeros(Float32, size(amps)) 
-    threshold *= maximum(mag.(amps))
-    fdiff = (0.5*(cfs[2, 1] - cfs[1, 1]))
-   
-    dists = copy(ifrs)
-    Threads.@threads for k in axes(ifrs, 2)
-        ifreq!(@view(ifrs[:, k]), @view(signal[:, k]), fs)
-    end
-
-    ifrs = permutedims(ifrs)
-    Threads.@threads for t in axes(ifrs, 2)
-        for k in (nn_oneside + 1):(size(ifrs, 1) - nn_oneside)
-            if amps[t, k] > threshold
-                for n in -nn_oneside:nn_oneside
-                    amps[t, k] *= exp(-((ifrs[k, t] - ifrs[k + n, t])^2) / sigma)
-                end
-            else 
-                amps[t, k] = 0
-            end
-
-        end
-
-        for k in 1:nn_oneside
-            if amps[t, k] > threshold
-                for n in (-k + 1):nn_oneside
-                    amps[t, k] *= exp(-((ifrs[k, t] - ifrs[k + n, t])^2) / sigma)
-                end
-            else 
-                amps[t, k] = 0
-            end
-        end
-        
-        for k in (size(amps, 2) - nn_oneside + 1):size(amps, 2)
-            if amps[t, k] > threshold
-                for n in -nn_oneside:0
-                    amps[t, k] *= exp(-((ifrs[k, t] - ifrs[k + n, t])^2) / sigma)
-                end
-            else 
-                amps[t, k] = 0
-            end
-        end
-    end
-
-
-    return ifrs, amps
-end
+using .TimeFrequencyTools
+#import ..TimeFrequencyTools.mag
 
 
 
 ########## sliding window SSA with frequency channel filtering
-export trackSubspaceLR, link_comps, recreate_signal, envelopes
+export ssa_windowed_peakchannels, ssa_windowed, mssa_windowed, link_comps, 
+    envelopes, update_hankel!, link_comps_sparse, params_longformat, trackchannels, track_crosschannels
+
+#=
+#Uses phase derivative to estimate instantaneous frequency of a sampled complex exponential. 
+#No phase unwrapping is required.
+function ifreqn(y::Vector{ComplexF32}, fs)
+    freqs = zeros(Float32, size(y, 1))
+    
+    Threads.@threads for i in 2:(size(y, 1) - 1)
+        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
+        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
+    end
+
+    freqs[1] = freqs[2]
+    freqs[end] = freqs[end - 1]
+
+    return freqs
+end
+
+function ifreq(x::Vector{T}, fs) where T >: Complex
+    y = x ./ mag.(x)
+    freqs = zeros(Float32, size(y, 1))
+    
+    Threads.@threads for i in 2:(size(y, 1) - 1)
+        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
+        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
+    end
+
+    freqs[1] = freqs[2]
+    freqs[end] = freqs[end - 1]
+
+    return freqs
+end
+
+function ifreq_sample(y, fs)
+    fs * imag(conj(y[2]) * .5 * (y[3] - y[1])) / (π*2) #* fs / ( 2 * π )
+end
+
+function ifreq(x::Matrix{T}, fs) where T >: Complex
+    y = x ./ (mag.(x) .+ eps())
+    freqs = zeros(Float32, size(y))
+    
+    Threads.@threads for j in axes(x, 2)
+        for i in 2:(size(y, 1) - 1)
+            freqs[i, j] = fs * imag(conj(y[i, j]) * .5 * (y[i + 1, j] - y[i - 1, j])) / (π*2) #* fs / ( 2 * π )
+            freqs[i, j] = (freqs[i, j] < 0) || (isnan(freqs[i, j])) ? 0 : freqs[i, j]
+        end
+    end
+
+    freqs[1, :] .= @view(freqs[2, :])
+    freqs[end, :] .= @view(freqs[end - 1, :])
+    #replace!(x -> x < 0 )
+    return freqs
+end
 
 
-function updateHankel!(hk, xk, ar_lags, wl)
+
+function ifreq(x::AbstractArray, fs)
+    y = x ./ mag.(x)
+    freqs = zeros(Float32, size(y, 1))
+    
+    Threads.@threads for i in 2:(size(y, 1) - 1)
+        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
+        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
+    end
+
+    freqs[1] = freqs[2]
+    freqs[end] = freqs[end - 1]
+
+    return freqs
+end
+
+#magnitude of complex value
+function mag(a)
+    sqrt(real(a)^2 + imag(a)^2)
+end
+
+function mag2(a)
+    real(a)^2 + imag(a)^2
+end
+
+function threshold_power(val, threshold)
+    mag(val) < threshold ? 0 : val
+end
+
+
+
+function windowAverages(aud, wgt, wl, ovlp)
+    
+    channels = zeros(eltype(aud), length(arraysplit(collect(1:size(aud, 1)), wl, ovlp)), size(aud, 2))
+
+    if isnothing(wgt)
+        Threads.@threads for j in axes(channels, 2)
+            window = arraysplit(1:size(aud, 1), wl, ovlp)
+    
+            for (i, wind) in enumerate(window)
+                channels[i, j] = mean(@view(aud[Int.(wind), j]))
+
+                if isnan(channels[i, j])
+                    channels[i, j] = 0
+                end
+            end
+        end
+    else
+
+        Threads.@threads for j in axes(channels, 2)
+            window = arraysplit(1:size(aud, 1), wl, ovlp)
+    
+            for (i, wind) in enumerate(window)
+                channels[i, j] = mean(@view(aud[Int.(wind), j]), weights(@view(wgt[Int.(wind), j])))
+                if isnan(channels[i, j])
+                    channels[i, j] = 0
+                end
+            end
+        end
+    end
+    
    
-   # hk = zeros(ComplexF32, ar_lags, wl - ar_lags + 1)
-    for j in 1:(wl - ar_lags + 1)
-        hk[:, j] .= @view(xk[j:(j + ar_lags - 1)])
+    return channels
+end
+
+
+function windowAverages(aud::Vector, wgt, wl, ovlp, mode = "mean")
+    
+    window = arraysplit(1:size(aud, 1), wl, ovlp)
+    channels = zeros(eltype(aud), length(window))
+  
+     if isnothing(wgt)
+          if mode == "mean"
+             for (i, wind) in enumerate(window)
+ 
+                 channels[i] = mean(@view(aud[Int.(wind)]))
+ 
+                 if isnan(channels[i])
+                     channels[i] = 0
+                 end
+             end
+         elseif mode == "median"
+             for (i, wind) in enumerate(window)
+ 
+                 channels[i] = median(@view(aud[Int.(wind)]))
+ 
+                 if isnan(channels[i])
+                     channels[i] = 0
+                 end
+             end
+         end
+     else
+ 
+         if mode == "mean"
+             for (i, wind) in enumerate(window)
+                 channels[i] = mean(@view(aud[Int.(wind)]), weights(@view(wgt[Int.(wind)])))
+                 if isnan(channels[i])
+                     channels[i] = 0
+                 end
+             end
+         elseif mode == "median"
+             for (i, wind) in enumerate(window)
+                 channels[i] = median(@view(aud[Int.(wind)]), weights(@view(wgt[Int.(wind)])))
+                 if isnan(channels[i])
+                     channels[i] = 0
+                 end
+             end
+         end
+     end
+     
+    
+     return channels
+ end
+
+ 
+=#
+function mag2(a)
+    real(a)^2 + imag(a)^2
+end
+
+
+function update_hankel!(hk, xk, embeddingDim, wl)
+   
+   # hk = zeros(ComplexF32, embeddingDim, wl - embeddingDim + 1)
+    for j in 1:(wl - embeddingDim + 1)
+        hk[:, j] .= @view(xk[j:(j + embeddingDim - 1)])
     end
 
     hk .-= mean(hk, dims = 2)
 end
+function update_hankel_mc!(hk, xk, embeddingDim, wl)
+   
+    for ch in axes(xk, 2)
+        for j in (1:(wl - embeddingDim + 1)) .+ ((ch - 1) * (wl - embeddingDim))
+            hk[:, j] .= @view(xk[j:(j + embeddingDim - 1), ch])
+        end
+ 
+        hk .-= mean(hk, dims = 2)
+    end
+end
 
-function trackSubspaceLR(tfd; ri, wl, ar_lags, step, overall_components, channel_components, min_eigval)
+ 
+function ssa_windowed_peakchannels(tfd; ri, wl, embeddingDim, step, components, channel_components, min_eigval)
     
  
     s = zeros(eltype(tfd), size(tfd, 2))
     
-    nWindows = size(ri, 2)
+    nWindows = size(ri, 2) - 1
     
-    bases = [zeros(ComplexF32, ar_lags, overall_components) for i in 1:nWindows]
-    activations = [zeros(ComplexF32, wl - ar_lags + 1, overall_components) for i in 1:nWindows]
+    bases = [zeros(ComplexF32, embeddingDim, components) for i in 1:nWindows]
+    activations = [zeros(ComplexF32, wl - embeddingDim + 1, components) for i in 1:nWindows]
     comps = zeros(Int32, nWindows)
 
-    explainedVar = [zeros(Float32, overall_components) for i in 1:nWindows]
-    hankels = [zeros(ComplexF32, ar_lags, wl - ar_lags + 1) for i in axes(tfd, 1)]
+    explainedVar = [zeros(Float32, components) for i in 1:nWindows]
+    hankels = [zeros(ComplexF32, embeddingDim, wl - embeddingDim + 1) for i in axes(tfd, 1)]
    
-    for w in 1:nWindows
+    maxeig = 0
+    Threads.@threads for w in 1:nWindows
         if w == nWindows
-            times = (size(tfd, 2) - wl):(size(tfd, 2))
-        else
-            times = ((w - 1)*step + 1):((w - 1)*step + wl)
+           wl = size(tfd, 2) - ((w - 1)*step + 1)
+           ri[:, w] .= 0.5 .* (ri[:, w] + ri[:, w + 1])
         end
+
+        times = ((w - 1)*step + 1):((w - 1)*step + wl)
+        
      
         println(w)
         
         peaks = findmaxima(@view(ri[:, w]))
-        bases[w] = zeros(ComplexF32, ar_lags, channel_components * length(peaks[1])) 
+        bases[w] = zeros(ComplexF32, embeddingDim, channel_components * length(peaks[1])) 
         explainedVar[w] = zeros(ComplexF32, channel_components * length(peaks[1])) 
         added = 0
         while !isempty(peaks[1])
             
             p = pop!(peaks[1])
-            updateHankel!(hankels[p], @view(tfd[p, times]), ar_lags, wl)
+            update_hankel!(hankels[p], @view(tfd[p, times]), embeddingDim, wl)
    
 
     
             u, s, v  = psvd(hankels[p], rank = channel_components, sketch = :sub, maxdet_niter = 100000, maxdet_tol = 5 * eps(), sketchfact_adap = true)
-            
-            keep = findfirst(x -> x < (min_eigval .* maximum(s)), s) 
+            if s[1] > maxeig
+                maxeig = s[1]
+            end
+            keep = findfirst(x -> x < (min_eigval .* maxeig), s) 
             if isnothing(keep)
                 keep = length(s)
             else
                 keep -= 1
             end
 
-          #=
-            for k in 1:keep
-                phase = atan(imag(u[1, k]), real(u[1, k])) + π
-                u[:, k] .*= cis(-phase)
-                v[:, k] .*= cis(-phase)
-            end
-            =#
             bases[w][:, (added + 1):(added + keep)] = @view(u[:, 1:keep]) 
-            activations[w][:, (added + 1):(added + keep)] = @view(v[:, 1:keep]) * diagm(s[1:keep])
+            activations[w][:, (added + 1):(added + keep)] = @view(v[:, 1:keep]) 
             explainedVar[w][(added + 1):(added + keep)] = s[1:keep] 
             
             added += keep
             
-            #=
-            for k in 1:keep
-                append!(tms, times[1] / fs)
-                append!(frs, mean_ifreq(@view(u[:, k]), fs, ar_lags))
-                append!(amps, s[k])
-            end
-            =#
+         
         end
         
        
         
         bases[w] = @view(bases[w][:, 1:added]) 
-        activations[w] =  @view(activations[w][:, 1:added]) 
+        activations[w] =  @view(activations[w][:, 1:added])
         explainedVar[w] = @view(explainedVar[w][1:added])
         comps[w] = added
         
         
     end
 
-    return bases, activations, comps
+    return bases, activations, explainedVar, comps
     #return explainedVar, bases, [tms frs amps]
 end
 
-export recreate_signal
-function recreate_signal(bases, activations, comps, wl, ar_lags, threshold, fs)
+function ssa_windowed(song; wl, embeddingDim, step, k, components, min_eigval, similarity_threshold)
+    
+
+    nWindows = Int(floor(((length(song)) - wl) / step))   #number of local SSA windows, i.e., the number of times SSA is performed
+    coefs = [1:embeddingDim ; repeat([embeddingDim], wl - (2 * embeddingDim)); embeddingDim:-1:1] #used for convolution method for hankelization of u, s, and v 
+    removed = Int(round((wl - step) / 2)) #number of elements truncated off each window's reconstructed components for the overlap-save concatenation
+    
+    
+    #sigs = [zeros(ComplexF32, wl, components) for i in 1:nWindows]  #preallocating the output, i.e., the reconstructed segments from each eigenvector triplet
+    sigs = Vector{Vector{ComplexF32}}() #initialize the output, i.e., the reconstructed segments from each eigenvector triplet
+    hankel = zeros(ComplexF32, embeddingDim, wl - embeddingDim + 1)  #preallocating the actual sequence's hankel trajectory matrix
+    starts = Vector{Int64}() #window start times
+
+    old_u = zeros(eltype(song), embeddingDim, components) #initialize matrix of previous window's eigenvectors
+    unused = collect(1:components) #columns of old_u that are inactive and can be overwritten 
+    paired = Vector{Int64}()
+    d = zeros(Float32, 2, 2) #initialize distance matrix of adjacent eigenvectors
+    mx = 0 #max covariance between eigenvectors of adjacent windows, used to link components
+    mapping = Dict{Int32, Int32}() #keys are rows of d, values are indices of sigs. Used to concatenate reconstructed components of window w to a pre-existing element of sigs if their basis vectors (u) are correlated enough
+    added = 0 #cumulative number of individual reconstructed components added to sigs
+    
+    
+    for w in 1:nWindows
+        println(w)
+        t1 = ((w - 1)*step + 1) #start time of the window
+      
+        if w == nWindows
+            
+            wl = length(song) - ((w - 1)*step + 1) #enlarge the last window if nWindows doesnt evenly divide the signal length
+            times = t1:(t1 - 1 + wl)
+            #removed = Int(round((wl - step) / 2)) #number of elements truncated off each window's reconstructed components for the overlap-save concatenation
+    
+    
+            #resizing variables to handle increased window length
+            hankel = zeros(ComplexF32, embeddingDim, wl - embeddingDim + 1)  
+            coefs = [1:embeddingDim ; repeat([embeddingDim], wl - (2 * embeddingDim)); embeddingDim:-1:1]
+            
+        end
+        times = t1:(t1 - 1 + wl)
+        #startTimes[w] = t1
+
+        update_hankel!(hankel, @view(song[times]), embeddingDim, wl)
+        u, s, v  = psvd(hankel, rank = k, sketch = :sub, maxdet_niter = 100000, maxdet_tol = 5 * eps(), sketchfact_adap = true)
+        keep = findfirst(x -> x < (min_eigval .* s[1]), s) 
+        keep = isnothing(keep) ? length(s) : (keep - 1)
+        
+        d = mag.(old_u' * @view(u[:, 1:keep]))
+      
+        for c in 1:keep
+            mx = findmax(@view(d[:, c]))
+
+            if (mx[1] > similarity_threshold) && (mx[1] >= findmax(@view(d[mx[2], :]))[1])
+                append!(sigs[mapping[mx[2]]], 
+                    hankelize(@view(u[:, c]), s[c], @view(v[:, c]), coefs, removed + 1, removed + step))
+                old_u[:, mx[2]] .= @view(u[:, c])
+                append!(paired, mx[2])
+            else
+                added += 1
+                push!(sigs, hankelize(@view(u[:, c]), s[c], @view(v[:, c]), coefs, 1, removed + step))
+                col = pop!(unused)
+                old_u[:, col] .= @view(u[:, c])
+                mapping[col] = added
+                append!(starts, [t1])
+            end
+            
+            #    sigs[w][:, c] .= s[c] * (coefs .* DSP.conv(conj.(@view(v[:, c])), @view(u[:, c])))
+        end
+        
+        unused = filter(x -> x ∉ paired, 1:components)
+       # sigs[w] = @view(sigs[w][:, 1:keep]) 
+        
+
+    end
+
+    return sigs, starts
+end
+
+function mssa_windowed(tfd; wl, embeddingDim, step, k, components, min_eigval, similarity_threshold)
+    
+
+    nWindows = Int(floor(((size(tfd, 1)) - wl) / step))   #number of local SSA windows, i.e., the number of times SSA is performed
+    coefs = repeat([1:embeddingDim ; repeat([embeddingDim], wl - (2 * embeddingDim)); embeddingDim:-1:1], size(tfd, 2)) #used for convolution method for hankelization of u, s, and v 
+    removed = Int(round((wl - step) / 2)) #number of elements truncated off each window's reconstructed components for the overlap-save concatenation
+    
+    
+    #sigs = [zeros(ComplexF32, wl, components) for i in 1:nWindows]  #preallocating the output, i.e., the reconstructed segments from each eigenvector triplet
+    sigs = Vector{Vector{ComplexF32}}() #initialize the output, i.e., the reconstructed segments from each eigenvector triplet
+    hankel = zeros(ComplexF32, embeddingDim, (wl - embeddingDim + 1)*size(tfd, 2))  #preallocating the actual sequence's hankel trajectory matrix
+    starts = Vector{Int64}() #window start times
+
+    old_u = zeros(eltype(tfd), embeddingDim, components) #initialize matrix of previous window's eigenvectors
+    unused = collect(1:components) #columns of old_u that are inactive and can be overwritten 
+    paired = Vector{Int64}()
+    d = zeros(Float32, 2, 2) #initialize distance matrix of adjacent eigenvectors
+    mx = 0 #max covariance between eigenvectors of adjacent windows, used to link components
+    mapping = Dict{Int32, Int32}() #keys are rows of d, values are indices of sigs. Used to concatenate reconstructed components of window w to a pre-existing element of sigs if their basis vectors (u) are correlated enough
+    added = 0 #cumulative number of individual reconstructed components added to sigs
+    
+    
+    for w in 1:nWindows
+        println(w)
+        t1 = ((w - 1)*step + 1) #start time of the window
+      
+        if w == nWindows
+            
+            wl = size(tfd, 1) - ((w - 1)*step + 1) #enlarge the last window if nWindows doesnt evenly divide the signal length
+            times = t1:(t1 - 1 + wl)
+            #removed = Int(round((wl - step) / 2)) #number of elements truncated off each window's reconstructed components for the overlap-save concatenation
+    
+    
+            #resizing variables to handle increased window length
+            hankel = zeros(ComplexF32, embeddingDim, (wl - embeddingDim + 1) * size(tfd, 2)) 
+            coefs = repeat([1:embeddingDim ; repeat([embeddingDim], wl - (2 * embeddingDim)); embeddingDim:-1:1], size(tfd, 2))
+            
+        end
+        times = t1:(t1 - 1 + wl)
+        #startTimes[w] = t1
+
+        update_hankel_mc!(hankel, @view(tfd[times, :]), embeddingDim, wl)
+        u, s, v  = psvd(hankel, rank = k, sketch = :sub, maxdet_niter = 100000, maxdet_tol = 5 * eps(), sketchfact_adap = true)
+        keep = findfirst(x -> x < (min_eigval .* s[1]), s) 
+        keep = isnothing(keep) ? length(s) : (keep - 1)
+        
+        d = mag.(old_u' * @view(u[:, 1:keep]))
+      
+        for c in 1:keep
+            mx = findmax(@view(d[:, c]))
+
+            if (mx[1] > similarity_threshold) && (mx[1] >= findmax(@view(d[mx[2], :]))[1])
+                append!(sigs[mapping[mx[2]]], 
+                    hankelize(@view(u[:, c]), s[c], @view(v[:, c]), coefs, removed + 1, removed + step))
+                old_u[:, mx[2]] .= @view(u[:, c])
+                append!(paired, mx[2])
+            else
+                added += 1
+                push!(sigs, hankelize(@view(u[:, c]), s[c], @view(v[:, c]), coefs, 1, removed + step))
+                col = pop!(unused)
+                old_u[:, col] .= @view(u[:, c])
+                mapping[col] = added
+                append!(starts, [t1])
+            end
+            
+            #    sigs[w][:, c] .= s[c] * (coefs .* DSP.conv(conj.(@view(v[:, c])), @view(u[:, c])))
+        end
+        unused = filter(x -> x ∉ paired, 1:components)
+       # sigs[w] = @view(sigs[w][:, 1:keep]) 
+        
+
+    end
+
+    return sigs, starts
+end
+
+#=
+function ssa_windowed_unlinked(song; wl, embeddingDim, step, components, min_eigval)
+    
+
+    nWindows = Int(floor(((length(song)) - wl) / step))   #number of local SSA windows, i.e., the number of times SSA is performed
+    coefs = [1:embeddingDim ; repeat([embeddingDim], wl - (2 * embeddingDim)); embeddingDim:-1:1] #used for convolution method for hankelization of u, s, and v 
+    removed = Int(round((wl - step) / 2)) #number of elements truncated off each window's reconstructed components for the overlap-save concatenation
+    
+    
+    sigs = [zeros(ComplexF32, step, components) for i in 1:nWindows]  #preallocating the output, i.e., the reconstructed segments from each eigenvector triplet
+    hankels = [zeros(ComplexF32, embeddingDim, wl - embeddingDim + 1) for i in 1:nWindows]  #preallocating the actual sequence's hankel trajectory matrix
+    
+    Threads.@threads for w in 1:nWindows
+        println(w)
+        t1 = ((w - 1)*step + 1) #start time of the window
+      
+        if w == nWindows
+            
+            wl = length(song) - ((w - 1)*step + 1) #enlarge the last window if nWindows doesnt evenly divide the signal length
+            times = t1:(t1 - 1 + wl)
+            #removed = Int(round((wl - step) / 2)) #number of elements truncated off each window's reconstructed components for the overlap-save concatenation
+    
+    
+            #resizing variables to handle increased window length
+            hankels[w] = zeros(ComplexF32, embeddingDim, wl - embeddingDim + 1)  
+            coefs = [1:embeddingDim ; repeat([embeddingDim], wl - (2 * embeddingDim)); embeddingDim:-1:1]
+            
+        end
+        times = t1:(t1 - 1 + wl)
+        #startTimes[w] = t1
+
+        update_hankel!(hankels[w], song[times], embeddingDim, wl)
+        u, s, v  = psvd(hankels[w], rank = components, sketch = :sub, maxdet_niter = 100000, maxdet_tol = 5 * eps(), sketchfact_adap = true)
+        keep = findfirst(x -> x < (min_eigval .* s[1]), s) 
+        keep = isnothing(keep) ? length(s) : (keep - 1)
+        
+     
+      
+        for c in 1:keep
+            sigs[w][:, c] .= hankelize(@view(u[:, c]), s[c], @view(v[:, c]), coefs, removed + 1, removed + step) 
+        end
+        
+        sigs[w] = @view(sigs[w][:, 1:keep]) 
+        
+
+    end
+
+    return sigs
+end
+=#
+
+function hankelize(u, s, v, coefs, a, b)
+   # coefs = [1:embeddingDim ; repeat([embeddingDim], wl - (2 * embeddingDim)); embeddingDim:-1:1]
+    s .* @view(coefs[a:b]) .* @view(DSP.conv(conj.(v), u)[a:b])
+end
+        
+#implements the hankelize method described in Korobeynikov, Anton. "Computation- and Space-Efficient Implementation of SSA."
+function hankelize_all(bases, activations, explainedVar, comps, wl, embeddingDim)
 
     sigs = [zeros(ComplexF32, wl, comps[i]) for i in 1:size(bases, 1)]
-    ifrs = [zeros(Float32, wl, comps[i]) for i in 1:size(sigs, 1)]
-    amps = [zeros(Float32, wl , comps[i]) for i in 1:size(sigs, 1)]
-    
+   
+
     Threads.@threads for b in axes(bases, 1)
         if comps[b] > 0
-    
-            sig_hankel = zeros(ComplexF32, ar_lags, wl - ar_lags + 1)
-  
             for c in 1:comps[b]
-                
-                counts = zeros(Int32, wl)  
-
-                mul!(sig_hankel, @view(bases[b][:, c]), (@view(activations[b][:, c]))')
-                
-            
-                for j in axes(sig_hankel, 2)
-                    for i in axes(sig_hankel, 1)
-                        sigs[b][i + j - 1, c] += sig_hankel[i, j]
-                        counts[i + j - 1] += 1
-                    end
-                    
-                end
-
-                sigs[b][:, c] ./= counts
-             
-                
+                sigs[b][:, c] .= explainedVar[b][c] * (coefs .* DSP.conv(conj.(@view(activations[b][:, c])), @view(bases[b][:, c])))
             end
-
-            ifrs[b], amps[b], sigs[b] = window_envelopes(sigs[b], fs, threshold)
-
         end
     end
 
-    return sigs, ifrs, amps
+    return sigs#, ifrs, amps
 end
 
 
-function link_comps(sigs, ifrs, amps, comps, wl, step, ovlp, siglength, similarity_threshold)
 
-    start = findfirst(x -> x > 0, comps)
-    strands =  zeros(ComplexF32, siglength, sum(comps))
-    strands[1:wl, start:comps[start]] .= sigs[1]
-    fstrands =  zeros(Float32, siglength, sum(comps))
-    fstrands[1:wl, start:comps[start]] .= ifrs[1]
-    astrands =  zeros(Float32, siglength, sum(comps))
-    astrands[1:wl, start:comps[start]] .= amps[1]
-    added = comps[start]
-    active = 1:comps[start]
-
-    startTimes = zeros(Int32, size(fstrands, 2))
-    startTimes[1:comps[start]] .= 1
-    endTimes = zeros(Int32, size(fstrands, 2)) .+ siglength
-   
-    for w in (start + 1):size(sigs, 1)
-        
-
-        if size(sigs[w], 2) > 0
-            d = mag.((norm_cols(@view(strands[((w - 2)*step + wl - ovlp + 1):((w - 2)*step + wl), active])))' * norm_cols(@view(sigs[w][1:(ovlp), :])))
-           
-            mx = findmax(d)
-            
-            still_active = zeros(Bool, size(d, 1))
-            new_comp = ones(Bool, size(d, 2))
-            while mx[1] > similarity_threshold
-                
-                for t in 1:(wl - step)
-                    #=
-                    strands[((w - 1)*step + 1):((w - 2)*step + wl), active[mx[2][1]]] ./= 2
-                    strands[((w - 1)*step + 1):((w - 2)*step + wl), active[mx[2][1]]] .+= (.5 .* @view(sigs[w][1:step, mx[2][2]]))
-                    strands[((w - 2)*step + wl + 1):((w - 1)*step + wl), active[mx[2][1]]] .=  @view(sigs[w][(step + 1):end, mx[2][2]])
-                =#
-
-                    tc = (cospi(t / ((wl - step) * 2))) ^ 2
-                    strands[((w - 1)*step + t), active[mx[2][1]]] *= tc
-                    strands[((w - 1)*step + t), active[mx[2][1]]] += ((1 - tc) * sigs[w][t, mx[2][2]])
-
-                    fstrands[((w - 1)*step + t), active[mx[2][1]]] *= tc
-                    fstrands[((w - 1)*step + t), active[mx[2][1]]] += ((1 - tc) * ifrs[w][t, mx[2][2]])
-
-                    astrands[((w - 1)*step + t), active[mx[2][1]]] *= tc
-                    astrands[((w - 1)*step + t), active[mx[2][1]]] += ((1 - tc) * amps[w][t, mx[2][2]])
-                end 
-
-                strands[((w - 2)*step + wl + 1):((w - 1)*step + wl), active[mx[2][1]]] .=  @view(sigs[w][(wl - step + 1):end, mx[2][2]])
-                fstrands[((w - 2)*step + wl + 1):((w - 1)*step + wl), active[mx[2][1]]] .=  @view(ifrs[w][(wl - step + 1):end, mx[2][2]])
-                astrands[((w - 2)*step + wl + 1):((w - 1)*step + wl), active[mx[2][1]]] .=  @view(amps[w][(wl - step + 1):end, mx[2][2]])
-            
-                d[:, mx[2][2]] .= -1
-                d[mx[2][1], :] .= -1
-            
-                still_active[mx[2][1]] = 1
-                new_comp[mx[2][2]] = 0
-
-                mx = findmax(d)
-            
-            end
-        end
-
-        endTimes[active[.! still_active]] .= (w)*step + wl
-        active = active[still_active]
-        
-        newComps = (1:comps[w])[new_comp]
-        for c in newComps
-            added += 1
-            startTimes[added] = (w)*step 
-            append!(active, added)
-            strands[((w - 1)*step + 1):((w - 1)*step + wl), added] .=  @view(sigs[w][:, c])
-            fstrands[((w - 1)*step + 1):((w - 1)*step + wl), added] .=  @view(ifrs[w][:, c])
-            astrands[((w - 1)*step + 1):((w - 1)*step + wl), added] .=  @view(amps[w][:, c])
-            
-        end
-    
-       # return active
-    end
-
-    return strands[:, 1:added], fstrands[:, 1:added], astrands[:, 1:added], [startTimes[1:added] endTimes[1:added]]
-end
-
-function envelopes(strands, ifrs, amps, fs, threshold, smoothingWindow = 6, swOvlp = 3)
+function params_longformat(sigs, times, fs, smoothingWl, smoothingOvlp)
   
-    times = (1:size(strands, 1)) ./ fs
-    threshold *= maximum(amps)
-    #threshold *= mean(amps[amps .> 0])
-    Threads.@threads for j in axes(strands, 2)
-        
-        for i in axes(amps, 1)
-            if (amps[i, j] < threshold) | (isnan(ifrs[i, j]))
-                ifrs[i, j] = 0
-                amps[i, j] = 0
-            end
-        end
-
-    end
-    wgts = copy(ifrs) #weights for taking averages
-    wgts[1:(end - 1), :] .-= @view(ifrs[2:end, :]) .+ eps()
-    wgts .= abs.(wgts)
-    wgts .^= (-1)
-    wgts .*= amps
-
-    ifrs = windowAverages(ifrs, wgts, smoothingWindow, swOvlp)
-    amps = windowAverages(amps, wgts, smoothingWindow, swOvlp)
-    times = windowAverages(times, nothing, smoothingWindow, swOvlp)
-
     fr = Vector{Float32}()
     am = Vector{Float32}()
     tm = Vector{Float32}()
 
-
-    for j in axes(ifrs, 2)
-        for i in axes(ifrs, 1)
-            if amps[i, j] > threshold
-                append!(fr, ifrs[i, j])
-                append!(am, amps[i, j])
-                append!(tm, times[i])
-            end
-        end
+    for j in axes(sigs, 1)
+        append!(fr, windowAverages(ifreq(sigs[j], fs), nothing, smoothingWl, smoothingOvlp, "median"))
+        append!(am, windowAverages(mag.(sigs[j]), nothing, smoothingWl, smoothingOvlp, "median"))
+        append!(tm, windowAverages(collect(times[j]:(times[j] + length(sigs[j]))) ./ fs, nothing, smoothingWl, smoothingOvlp, "median"))
     end
+    am ./= maximum(am)
+    return  [tm fr am]
+end
 
-    return [tm fr am]
 
-    
+
+
+
+
+
+
+
+############ NLMS and trajectory smoothing stuff
+
+#export trackchannels, track_crosschannels
+
+
+#Normalized least mean squares, one of the most popular adaptive filters
+function update_NMLS!(predictions, errors, coefs, x, v, mu, e)
+
+    #make prediction
+    predictions[end] = dot(coefs, @view(x[1:(end - 1)]))
+
+    #calculate error
+    errors[end] = (x[end] - predictions[end])
+   
+    #adjust coefficients according to instantaneous gradient of mean square error
+    coefs .+= ((mu * conj(errors[end])) / (v + e)) .* @view(x[1:(end - 1)])
+   
+
 
 end
 
-function window_envelopes(strands, fs, threshold)
-    ifrs = zeros(Float32, size(strands))
-    amps = mag.(strands)
-  
-    tr = threshold * maximum(amps)
-    #threshold *= mean(amps[amps .> 0])
-    Threads.@threads for j in axes(strands, 2)
-        ifrs[:, j] .= ifreq(@view(strands[:, j]), fs)
-       
-       
-        for i in axes(amps, 1)
-            if (amps[i, j] < tr) | (isnan(ifrs[i, j]))
-                ifrs[i, j] = 0
-                amps[i, j] = 0
-            end
-        end
+function update_NMLS_multi!(predictions, errors, coefs, crossCoefs, x, v, ts, te, plan)
+    
+   #make prediction
+   predictions[te + 1] = dot(crossCoefs, @view(x[ts:te]))
 
+   #calculate error
+   errors[te + 1] = (x[te + 1] - predictions[te + 1])
+  
+   #adjust coefficients according to instantaneous gradient of mean square error
+   crossCoefs .+= ((plan.mu * conj(errors[te + 1])) / (v + plan.e) .* @view(x[ts:te]))
+  
+end
+
+
+
+
+
+function trackchannels(tfd; mu, e, p, minAmplitude, ds = ds, saveEvery = 100);
+    
+    tfd = @view(tfd[1:ds:end, :])
+    nWindows = Int(floor((size(tfd, 1) - p )/ saveEvery)) 
+  
+    power = mag2.(tfd)
+    predictions = similar(tfd)
+    errors = similar(tfd)
+   
+    Threads.@threads for k in axes(power, 2)
+        power[:, k] .= (runmean(@view(power[:, k]), p) .* p)
     end
+
+    threshold = maximum(power) * minAmplitude
+    coefs = zeros(ComplexF32, p, size(tfd, 2))
+
+    for w in 1:(nWindows - 1) #saveEvery:(size(tfd, 1) - plan.p)
+        Threads.@threads for k in axes(tfd, 2)
+            for t in ((w - 1) * saveEvery + 1):(w * saveEvery)
+                if power[t, k] > threshold
+                    update_NMLS!(@view(predictions[t:(t + p), k]), @view(errors[t:(t + p), k]), @view(coefs[:, k]),  @view(tfd[t:(t + p), k]), power[t + p - 1, k], mu, e)
+                end
+
+            end
+
+            
+        end
+        #println(t)
+    end
+   
+    return predictions, errors #, allCoefs
+         
+end
+
+#export track_crosschannels
+function track_crosschannels(tfd; mu, e, p, minPrediction, minAmplitude, ds = ds, saveEvery = 100);
+    
+    tfd = @view(tfd[1:ds:end, :])
+    nWindows = Int(floor((size(tfd, 1) - p )/ saveEvery)) 
+    power = mag2.(tfd)
+    
+    coefs = zeros(eltype(tfd), size(tfd, 2), p)
 
     #=
-    ifrs = windowAverages(ifrs, smoothingWindow, swOvlp)
-    amps = windowAverages(amps, smoothingWindow, swOvlp)
+    coefs = Dict{Int, Vector{eltype(tfd)}}()
+    whichChannels = Dict{Int, Vector{Int}}()
+    whichCoefs = Dict{Int, Vector{Int}}()
+    =#
+    channelIsActive = zeros(Bool, size(tfd, 2))
+    coefIsActive = zeros(Bool, size(tfd, 2))
+    coefCov =  zeros(eltype(tfd), size(tfd, 2), size(tfd, 2))
+    coefChannelCov =  zeros(eltype(tfd), size(tfd, 2), size(tfd, 2))
+
+    Threads.@threads for k in axes(power, 2)
+        power[:, k] .= (runmean(@view(power[:, k]), p))
+    end
+
+    tfd = permutedims(tfd)
+    power = permutedims(power)
+    signalComps = similar(tfd)
+    predictions = similar(tfd)
+    errors = copy(tfd)
+
+    ampThreshold = maximum(power) * sqrt(minAmplitude)
+
+    for t in 1:(size(tfd, 2) - p)
+        salientChannels = findall(x -> x > ampThreshold, @view(tfd[k, t + p]))
+        for k in salientChannels
+            if channelIsActive[k]
+                    
+                if length(whichCoefs[k]) > 1
+                    preds = @view(coefs[whichCoefs[k], :]) \  @view(tfd[k, t:(t + p - 1)]) #(conj.(@view(coefs[whichCoefs[k], :])) * @view(tfd[k, t:(t + p - 1)]))
+                    signalComps[whichCoefs[k], t + p] .+= preds
+                    predictions[k, t + p] = sum(preds)
+                    errors[k, t + p] -= predictions[k, t + p]
     
-    times = windowAverages(strands, smoothingWindow, swOvlp)
+
+                else
+                    signalComps[c, t + p] += (conj.(@view(coefs[c, :])) * @view(tfd[k,  t:(t + p - 1)]))
+                    predictions[k, t + p] = sum(preds)
+                    errors[k, t + p] -= predictions[k, t + p]
+        
+                
+                end
+
+            else
+                channelIsActive[k] = true
+
+            end
+
+
+        for c in eachindex(coefIsActive)
+            for k in whichChannels[c]
+                if length(whichCoefs[k]) > 1
+                    
+                    preds = @view(coefs[whichCoefs[k], :]) \  @view(tfd[k, (t - p):(t + p)]) #(conj.(@view(coefs[whichCoefs[k], :])) * @view(tfd[k, t:(t + p - 1)]))
+                    signalComps[whichCoefs[k], t] .+= preds
+                    predictions[k, t] = sum(preds)
+                    errors[k, t] -= predictions[k, t]
+    
+
+                else
+                    signalComps[c, t] += (conj.(@view(coefs[c, :])) * @view(tfd[k, (t - p):(t + p)]))
+                    predictions[k, t] = sum(preds)
+                    errors[k, t] -= predictions[k, t]
+        
+                
+                end
+               
+            end
+        end
+    end
+        #= 
+        predictions_unrefined .= coefs * @view(tfd[t:(t + p - 1), k])
+        residuals_unrefined .=  @view(tfd[t + p, :])
+        channelMag .= mag.(residuals_unrefined)
+        total = sum(channelMag)
+        threshold = total * minAmplitude
+        
+        while total > threshold
+            m = argmax(channelMag)
+            b = argmin(@view(predictions_unrefined[:, m]))
+            included[b] = true
+            residuals_unrefined .-= @view(predictions_unrefined[b, :])
+            channelMag .= mag.(residuals_unrefined)
+            total = sum(channelMag)
+        end
+        
+        
+        for i in eachindex(included)
+            if !included
+                predictions_unrefined[i, :] .= 0
+                #update_NMLS!(@view(predictions[:, k]), @view(errors[:, k]), @view(coefs[:, k]),  @view(tfd[:, k]), power[t + plan.p - 1, k], t, t + plan.p - 1, plan)
+            end
+        end
+
+        Threads.@threads for k in axes(crossCoefs, 2)
+            channelCrossCov = predictions_unrefined' * predictions_unrefined
+            if included
+                update_NMLS!(@view(predictions[:, k]), @view(errors[:, k]), @view(coefs[:, k]),  @view(tfd[:, k]), power[t + plan.p - 1, k], t, t + plan.p - 1, plan)
+            else
+
+            end
+            predictions_unrefined[i, :] .= 0
+            update_NMLS_multi!(@view(predictions[:, k]), @view(errors[:, k]), @view(coefs[:, k]), @view(crossCoefs[:, k]),  @view(tfd[:, k]), power[t + plan.p - 1, k], t, t + plan.p - 1, plan)
+            
+            
+        end
+    end
+        
+    
+    
+
+
+    return predictions, errors, coefs
 =#
+end
 
-    return ifrs, amps, strands
+#export dft_matrix, ar_spectrum
+function dft_matrix(fbins, ncoef, fs)
 
-    
+    m = zeros(ComplexF32, length(fbins), ncoef)
+
+    for j in axes(m, 2)
+        for i in axes(m, 1)
+            m[i, j] = cispi(-2 * j * fbins[end - i + 1] / fs)
+        end
+    end
+    m
+end
+
+function ar_spectrum(coefs, dftmat)
+
+    spec = (1 .+ (dftmat * coefs))
+    spec .= real.(spec) .^ 2 .+ imag.(spec) .^ 2
+
+    return 1 ./ real.(spec)
+end
+
+mutable struct NLMSParam
+    mu::Float64
+    e::Float64
+    p::Int64
+    energySmoothing::Float64
+    minAmplitude::Float64
+end
 
 end
 
+#### component extraction
+#=
+export track_components
 
 
+function track_components(tfd, fs; timeres, minLength, minAmplitude, burnin)
 
-export freqStrand_tv_smoothed
+   
+    wl = Int(round(timeres * fs))
+    nWindows = Int(floor(size(tfd, 1) / wl))
+    times = 1:wl
+    ml = Int(round(minLength * fs))
+    amps = mag.(tfd)
+   
+    tStarts = zeros(Int64, size(tfd, 2))
+    strands = Dict{Tuple{Int64, Int64}, Matrix{Float32}}()
 
-
-function freqStrand_tv_smoothed(freqs, amps, tfd, cfs, elasticity, maxiter = 1000)
+    inactive = [t*-rue for i in axes(tfd, 2)]
+    #newlyActive = [false for i in axes(tfd, 2)]
+    #newlyEnded = [false for i in axes(tfd, 2)]
+   
+    for w in 1:nWindows
+        times = ((w - 1)*wl + 1):(w * wl)
     
-    #forces =  DSP.conv(permutedims(tfd), [-.5; 0; -.5])[2:(end - 1), :]
-    fRes = cfs[2] - cfs[1]
-    minFreq = cfs[1]
-    for j in axes(freqs, 2)
-        println(j)
-        startTime = findfirst(x -> x > 0, @view(amps[:, j])) + 1
-        endTime = findfirst(x -> x < .0000001, @view(amps[(startTime + 1):end, j])) + startTime 
-       
-    
-        if (endTime - startTime) > 10
-            #freqDiffs = runmean(pushfirst!(diff(@view(freqs[startTime:endTime])), 0), 2)
-            stretch = DSP.conv(freqs[startTime:endTime, j], [.50f0, -1.0f0, .50f0])[2:(end - 1)]
-            stretch[1] += 0.5*freqs[startTime, j]
-            stretch[end] += 0.5*freqs[end - 1, j] 
+        meanAmps = mean(@view(amps[times, :]), dims = 1)
+        threshold = maximum(meanAmps) * minAmplitude
+      
+        println(w)
+        for k in axes(tfd, 2)
+        
+            if inactive[k]
+                if meanAmps[k]  > threshold
 
-            peak = argmax(stretch[2:(end - 1)]) + 1
-            moved = true
-            peakChanged = true
-            iters = 0
-            while (moved || peakChanged) && (iters <= maxiter)
-                iters += 1
-                println(peak)
-                current_spec_energy = interpolate_freqbins(hzToErb(freqs[peak + startTime, j]), peak, tfd, fRes, minFreq)
-                proposed_spec_energy = interpolate_freqbins(hzToErb(freqs[peak + startTime, j] - stretch[peak]), peak, tfd, fRes, minFreq)
-            
-                if (abs(stretch[peak + 1]) * elasticity) > (proposed_spec_energy - current_spec_energy)
-                    if peak > 2 
-                        if peak < (size(stretch, 1) - 1)
-                            freqs[peak + startTime, j] -= stretch[peak]
-                            stretch[peak - 1] = mean([freqs[peak + startTime - 2, j], freqs[peak + startTime, j] ]) - freqs[peak + startTime - 1, j]
-                            stretch[peak + 1] = mean([freqs[peak + startTime, j], freqs[peak + startTime + 3, j] ]) - freqs[peak + startTime + 1, j]
-                    
-                            peak = argmax([stretch[peak - 1], stretch[peak + 1]])
-                        else
-                            peak =  (size(stretch, 1) - 1)
-                        end
-                    else
-                        peak = 2
+                    #newlyActive[k] = true
+                    inactive[k] = false
+                    tStarts[k] = times[1]
+                end
+            else
+                if meanAmps[k] < threshold
+                    #newlyEnded[k] = true
+                    inactive[k] = true
+        
+                    #ts = tStarts[k]:times[end]
+                  
+                    if  (times[end] - tStarts[k]) > ml
+                        strands[(tStarts[k], k)] = [((tStarts[k]:times[end]) ./ fs) ifreq(@view(tfd[tStarts[k]:times[end], k]), fs) @view(amps[tStarts[k]:times[end], k])]
                     end
-                       
-
-                    moved = true
                     
-                else
-                    moved = false
-                    newPeak = argmax(stretch[2:(end - 1)]) + 1
-                    peakChanged = newPeak != peak
-                    peak = newPeak
+                    tStarts[k] = 0
                 end
             end
+
+        end
+
+
+        for k in axes(tfd, 2)
+            if !inactive[k]
+                *
+
         end
     end
-     
-    return fRes
-end
 
-function hzToErb(f)
-    erb = 21.4 * log10((4.37 * f / 1000) + 1)
-    return erb
-end
-
-function interpolate_freqbins(freq, time, tfd, fRes, minFreq)
-    fBin = ((freq - minFreq) / fRes) + 1
-    if fBin < 1
-        fUp = 2
-        fDown = 1
-    else
-        fUp = Int(ceil(fBin))
-        fDown = Int(floor(fBin))
-    end
-    (tfd[fUp, time] - tfd[fDown, time]) * fBin
-
-end
-############ NLMS and trajectory smoothing stuff
-export init_AR, plan_AR, tracker_AR, tracker_AR_complex, update_NLMS!, spectra_from_AR
- 
-
-
-
-function update_NLMS!(ar, plan, xNext, t; fs, fmin, fmax, fstep, threshold)
-    append!(ar.predictions, dot(ar.h, ar.x))
-    append!(ar.errors, xNext-ar.predictions[end])
-    ar.V *= plan.gamma
-    ar.V += (1 - plan.gamma)* real(ar.x[end] * conj(ar.x[end]))#(ar.x[end]^2)
-    ar.h .+= ((plan.alpha/(ar.V + plan.beta))*(ar.errors[end])).*ar.x
-    popfirst!(ar.x)
-    #popfirst!(ar.predictions)
-    #popfirst!(ar.errors)
-    append!(ar.x, plan.sigma*ar.predictions[end] + (1 - plan.sigma)*xNext)
-
-    ar.past_h[:, t] .= ar.h
-
-
-end
-
-function init_AR(plan, h = zeros(Float32, plan.p), x = zeros(Float32, plan.p); start = "linear", signal_length)
-    if start == "linear"
-        h[end - 1] = -1 * plan.sigma
-        h[end] = 2 * plan.sigma
-    end
-
-    past_h = zeros(eltype(h), plan.p, signal_length)
-    frequencies = zeros(Float32, plan.frs, signal_length)
-    ar = tracker_AR(0, h, x, [0], [0], past_h, frequencies)
-end
-
-function spectra_from_AR(sigma, ar, fs, fmin, fmax, fstep)
-    freqs = fmin:fstep:fmax
-    amps = ones(ComplexF64, length(freqs))
-
-    Threads.@threads for i in axes(amps, 1)
-        for k in axes(ar, 1)
-            amps[i] -= conj(ar[length(ar) - k + 1]) * cispi(-2 * k * freqs[i] / fs)
-        end
-        amps[i] *= conj(amps[i])
-        amps[i] = sigma / amps[i]
-
-    end
-
-    return freqs, real.(amps)
-
-end
-
-
-mutable struct tracker_AR
-    V::Float64
-    h::Vector{Float64}
-    x::Vector{Float64}
-    predictions::Vector{Float64}
-    errors::Vector{Float64}
-
-    past_h::Matrix{Float64}
-    frequencies::Matrix{Float64}
-end
-
-mutable struct tracker_AR_complex
-    V::Float64
-    h::Vector{ComplexF64}
-    x::Vector{ComplexF64}
-    predictions::Vector{ComplexF64}
-    errors::Vector{ComplexF64}
-
-    past_h::Matrix{ComplexF64}
-    frequencies::Matrix{Float64}
-end
-
-
-
-
-
-
-
-
-end
-
-
-
-
-####### Total variation denoising to obtain smooth frequency tracks
-#This code is entirely copied from here: https://github.com/fundamental/TotalVariation.jl/blob/master/src/TotalVariation.jl
-#It has been pasted in due to an unresolvable package version conflict.
-
-module TotalVariation
-
-using  DSP, SparseArrays, LinearAlgebra, RollingFunctions
-export gstv, tv
-#See ``Total Variation Denoising With Overlapping Group Sparsity'' by
-# Ivan Selesnick and Po-Yu Chen (2013)
-
-#Group Sparse Total Variation Denoising
-function gstv(y::Vector, k, λ; show_cost = false, iter = 10)
-    #Initialize Solution
-    N  = length(y)
-    x  = copy(y)
-
-    #Differential of input
-    b = diff(y)
-
-    #Precalculate D D' where D is the first-order difference matrix
-    DD::SparseMatrixCSC{Float64,Int} = spdiagm(-1=>-ones(N-2), 0=>2*ones(N-1), 1=>-ones(N-2))
-  
-   
-    #Convolution Mask - spreads D x over a larger area
-    #This regularizes the problem with applying a gradient to a larger area.
-    #at k=1 the normal total variational sparse solution (for D x) is found.
-   
-    u = similar(b)
-    r = similar(b)
-    Λ = similar(b)
-    F = sparse(Diagonal(1 ./ Λ))/λ + DD
-    
-
-    tmp = similar(b)
-    dfb = diff(tmp)
-
-    Threads.@threads for i=1:iter
-        u = diff(x)
-        r = sqrt.(max.(eps(), runmean(u, k))) 
-        Λ = runmean(1 ./ r, k)
-        F = sparse(Diagonal(1 ./ Λ))/λ + DD
+    for k in axes(tfd, 2)
+        if !inactive[k] 
+            #ts = collect(tStarts[k]:times[end]) 
+            if (times[end] - tStarts[k]) > ml
+                strands[(tStarts[k], k)] = [((tStarts[k]:times[end]) ./ fs) ifreq(@view(tfd[tStarts[k]:times[end], k]), fs) @view(amps[tStarts[k]:times[end], k])]
         
-
-        tmp = F\b
-        dfb = diff(tmp)
-
-        x[1]       = y[1]       + tmp[1]
-        x[2:end-1] = y[2:end-1] + dfb[:] 
-        x[end]     = y[end]     - tmp[end]
-    end
-
-    return x
-end
-
-export gstv_multi
-function gstv_multi(y::Matrix, k, λ; show_cost = false, iter = 10, batchsize = size(y, 1))
-    #Initialize Solution
-   
-    x  = copy(y)
-
-    
-    N  = batchsize
-    batches = div(size(y, 1), batchsize)
-    #Precalculate D D' where D is the first-order difference matrix
-    DD::SparseMatrixCSC{Float64,Int} = spdiagm(-1=>-ones(N-2), 0=>2*ones(N-1), 1=>-ones(N-2))
-
-
-    for batch in 1:batches
-        Threads.@threads for j in axes(y, 2)
-      
-            #Differential of input
-            b = diff(@view(y[((batch - 1)*batchsize + 1):((batch)*batchsize), j]))
-
-            #=
-            u = similar(b)
-            r = similar(b)
-            Λ = similar(b)
-            F = sparse(Diagonal(1 ./ Λ))/λ + DD
-            
-
-            tmp = similar(b)
-            dfb = diff(tmp)
-                =#
-            
-            for i in 1:iter
-                u = diff(@view(x[((batch - 1)*batchsize + 1):(batch*batchsize), j]))
-                r = sqrt.(max.(eps(), runmean(u, k))) 
-                Λ = runmean(1 ./ r, k)
-                F = sparse(Diagonal(1 ./ Λ)) ./ λ .+ DD
-                
-
-                tmp = F\b
-                dfb = diff(tmp)
-
-                x[((batch - 1)*batchsize + 1), j] = y[((batch - 1)*batchsize + 1), j] + tmp[1]
-                x[((batch - 1)*batchsize + 2):((batch*batchsize) - 1), j] .= @view(y[((batch - 1)*batchsize + 2):((batch*batchsize) - 1), j]) .+ dfb
-                x[(batch*batchsize), j] = y[(batch*batchsize), j] - tmp[end]
             end
         end
     end
 
-    return x
+
+    return strands
 end
 
-end # module
+
+
+
+mutable struct ComponentTracker{T}
+    
+    tStart::Int64
+    tEnd::Int64
+    signal::Vector{T}
+
+end
+
+
+
+
+end
+=#
+#end

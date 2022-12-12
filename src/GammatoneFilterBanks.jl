@@ -12,11 +12,14 @@
 
 module GammatoneFilterBanks
 
+include("./TimeFrequencyTools.jl")
+using .TimeFrequencyTools
+
 using DSP, StatsBase, Peaks, DataStructures, LinearAlgebra, RollingFunctions
 
 export create_gt_cascade_filterBank, applyFilterbank, getComplexGammatone, createComplexGTFilterBank, 
-    applyComplexFilterbank, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, hzToErb, erbWidth, 
-    erbToHz, getErbBins, biquadParam, synchrosqueeze #gt_cascaded_filterbank
+    applyComplexFilterbank, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, erbWidth,
+    getErbBins, biquadParam #gt_cascaded_filterbank
 
 
 function erbWidth(f)
@@ -24,15 +27,6 @@ function erbWidth(f)
     return erb
 end
 
-function hzToErb(f)
-    erb = 21.4 * log10((4.37 * f / 1000) + 1)
-    return erb
-end
-
-function erbToHz(erb)
-    f = (10 ^ (erb / 21.4) - 1) * 1000 / 4.37 
-    return f
-end
 
 function getErbBins(fmin, fmax, bins)
     
@@ -334,30 +328,7 @@ function clean_crossTalk!(spectra, complexSig, wl, ovlp; neighborhood = 5, sigma
     return smoothPhase
 
 end
-function synchrosqueeze(ifreqs, amps, cfs, fs, threshold)
-    squeezed = zeros(Float64, reverse(size(amps))) 
-    threshold *= maximum(amps)
-    fdiff = (0.5*(cfs[2, 1] - cfs[1, 1]))
-    Threads.@threads for t in axes(squeezed, 2)
-        for k in axes(squeezed, 1)
-            if amps[t, k] > threshold
-                #newBin = maximum([maximum([k - 5, 1]) , minimum([minimum([k + 3, size(amps, 2)]), k + round(Int32, (hzToErb(ifreqs[t, k]) - fb.cfs[k, 1])/fdiff)]) ])
-                newBin = k + round(Int32, (hzToErb(ifreqs[t, k]) - cfs[k, 1])/fdiff)
 
-                if checkindex(Bool, 1:size(squeezed, 1), newBin)
-                    squeezed[newBin, t] = amps[t, k]
-                end
-            end
-           
-            #movement[newBin, t] +=  ((amps[t, k]) * abs(newBin - k))#/ sqrt(real(freqresp(fb.filters[k], ifreqs[t, k] * 2π / fs))^2 + imag(freqresp(fb.filters[k], ifreqs[t, k] * 2π / fs))^2))
-            #movement[k, t] -= amps[t, k]
-
-        end
-        #movement[1, t] = 0
-        #movement[end, t] = 0
-    end
-    return transpose(squeezed)
-end
 
 
 mutable struct biquadParams

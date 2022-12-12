@@ -1,4 +1,4 @@
-module AutomaticMusicTranscription
+module PolyphonicSignals
 
 #using Revise
 using WAV
@@ -23,15 +23,17 @@ include("./AdaptiveSingularFilterBank.jl")
 
 #export from time-frequency analysis module 
 export getSongMono, compress_max!, downsample, clipAudio, createSignalFromInstFA, sampleCosine, 
-    createEnvelope, midEarHighPass!,  getPeakList, connectStrands, plotSpectrogram, plotAudio,
-    plotDFT, plotFB, plotStrandBook, getAngle, windowAverages, audioRecord, 
-    audStrand, getSTFT, getPowerSpectrum, amp_from_windowPeaks, get_inst_power_exponential, get_hilbert,
-    ifreq_from_phase, freq_reassignment_direction, getRidgeTops, ridgeTop, 
-    freq_resp_basis
+    createEnvelope, midEarHighPass!, getSTFT, getPowerSpectrum, freq_reassignment_direction, 
+    envelope_AC_DC, windowedSignal, plotSpectrogram, plotAudio, plotDFT, plotFB, plotStrandBook, 
+    getAngle, windowAverages, mag, get_phase_shift, ifreq, mean_ifreq, norm_cols,  phase_align, 
+    synchrosqueeze, synchrosqueeze_hpss, ispeak, hzToErb, erbToHz, AudioRecord
+
+
 
 export create_gt_cascade_filterBank, applyFilterbank, getComplexGammatone, createComplexGTFilterBank, 
-    applyComplexFilterbank, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, hzToErb, erbWidth, 
-    erbToHz, getErbBins, gt_cascaded_filterbank
+    applyComplexFilterbank, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, erbWidth,
+    getErbBins, biquadParam #gt_cascaded_filterbank
+
 
 
 
@@ -44,12 +46,17 @@ export analysisFB!, synthesisFB!, tqwt!, itqwt!, tqwtParams, scale_lowpass, scal
 #export from MCA module
 export salsa
 
+#export from AdaptiveSingularFilterBank
+export ssa_windowed_peakchannels, ssa_windowed, mssa_windowed, link_comps, 
+    envelopes, update_hankel!, link_comps_sparse, params_longformat, trackchannels, track_crosschannels
+
+#import modules
 using .TimeFrequencyTools
 using .TQWT
 using .MorphologicalComponents
 using .GammatoneFilterBanks
 using .AdaptiveSingularFilterBank
-using .TotalVariation
+
 
 
 end

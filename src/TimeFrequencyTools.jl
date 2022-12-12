@@ -11,7 +11,14 @@ using Revise
 
 
 ### signal reading, generation, and modification in time domain
-export getSongMono, compress_max!, downsample, clipAudio, createSignalFromInstFA, sampleCosine, createEnvelope, midEarHighPass!
+export getSongMono, compress_max!, downsample, clipAudio, createSignalFromInstFA, sampleCosine, 
+    createEnvelope, midEarHighPass!, getSTFT, getPowerSpectrum, freq_reassignment_direction, 
+    envelope_AC_DC, windowedSignal, plotSpectrogram, plotAudio, plotDFT, plotFB, plotStrandBook, 
+    getAngle, windowAverages, mag, mag2, get_phase_shift, ifreq, mean_ifreq, norm_cols,  phase_align, 
+    synchrosqueeze, synchrosqueeze_hpss, ispeak, hzToErb, erbToHz
+
+
+export AudioRecord
 
 
 function getSongMono(fname, sTime, eTime)
@@ -22,7 +29,7 @@ function getSongMono(fname, sTime, eTime)
     song = song[s_start:s_end, :]
     song = (song[:, 1] .+ song[:, 2]) / 2
 
-    return audioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
+    return AudioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
 
 end
 
@@ -39,27 +46,39 @@ function compress_max!(aud, minMult, maxMult)
 
 end
 
-function downsample(audio, newFs, lowpass = true)
+function downsample(audio::AudioRecord, newFs)
     
 
-    if lowpass
 
-        rs1 = DSP.resample(@view(audio.channels[:, 1]), newFs / audio.fs)
-        rs = zeros(eltype(audio.channels), length(rs1), size(audio.channels, 2,))
+
+
+    if size(audio.channels, 2) > 1
+        
+        #=
+        rs1 = DSP.resample(@view(audio.channels[:, 1]), round(newFs / audio.fs, digits = 1))
+        rs = zeros(eltype(audio.channels), length(rs1), size(audio.channels, 2))
         rs[:, 1] .= rs1
 
         Threads.@threads for j in 2:size(audio.channels, 2)
-            rs[:, j] .= resample(@view(audio.channels[:, j]), newFs / audio.fs)
+            rs[:, j] .= resample(@view(audio.channels[:, j]), round(newFs / audio.fs, digits = 1))
         end
 
+        newFs = round(newFs / audio.fs, digits = 1) * audio.fs
+        return AudioRecord(audio.cfs, rs, newFs, size(rs, 1) / newFs, audio.nchannels)
+    =#
+        newFs = round(newFs / audio.fs, digits = 1) * audio.fs
+        audio.channels = DSP.resample(audio.channels,  round(newFs / audio.fs, digits = 1), dims = 1)
     else
-        factor = Int(ceil(audio.fs / newFs))
-
-        rs = @view(audio.channels[1:factor:end, :])
-        newFs = audio.fs / factor
+        rs = resample(audio.channels, round(newFs / audio.fs, digits = 1))
+        newFs = round(newFs / audio.fs, digits = 1) * audio.fs
+        return AudioRecord(audio.cfs, rs, newFs, length(rs) / newFs, 1)
     end
 
-    return audioRecord(audio.cfs, rs, newFs, size(rs, 1) / newFs, audio.nchannels)
+    
+
+    #AudioRecord(audio.cfs, resample(audio.channels, newFs / audio.fs), newFs, len)
+
+    
 end
 
 function clipAudio(aud, sTime, eTime)
@@ -70,7 +89,7 @@ function clipAudio(aud, sTime, eTime)
     song = song[s_start:s_end, :]
     
 
-    return audioRecord(aud.cfs, song, fs, round(length(song)/fs, digits = 3), aud.nchannels)
+    return AudioRecord(aud.cfs, song, fs, round(length(song)/fs, digits = 3), aud.nchannels)
 end
 
 function exp_sawtooth_envelope(len, decay, period)
@@ -91,7 +110,7 @@ end
 function createSignalFromInstFA(frequencies, amplitudes, fs)
 
     song = sampleCosine(frequencies, amplitudes, fs)
-    s = audioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
+    s = AudioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
     
     return s
 end
@@ -129,7 +148,6 @@ function midEarHighPass!(aud, alpha)
 end
 
 #time-frequency distributions
-export getSTFT, getPowerSpectrum, freq_reassignment_direction
 
 function getSTFT(songMono, winLen, ovlp, interp, fs)
     
@@ -182,8 +200,6 @@ end
 
 import LinearAlgebra.dot
 
-export envelope_AC_DC, windowedSignal
-
 function envelope_AC_DC(tfd, wl, step)
     nWindows = Int(div(size(tfd, 1) - wl, step))
     AC = zeros(Float64, nWindows, size(tfd, 2))
@@ -202,156 +218,12 @@ end
 function windowedSignal(aud, tfdNew, step)
     fsNew = aud.fs/step
     dNew = size(tfdNew, 1) / fsNew
-    return audioRecord(aud.cfs, tfdNew, fsNew, dNew, aud.nchannels)
+    return AudioRecord(aud.cfs, tfdNew, fsNew, dNew, aud.nchannels)
 
 end
-
-#synchrony strands
-export getPeakList, connectStrands
-
-function getPeakList(aud, threshold)
-    ch = transpose(aud.channels)
-    minAmplitude = maximum(ch)*threshold
-    peakList = Vector{Dict{Int64, audStrand}}(undef, size(ch, 2))
-
-    Threads.@threads for t in axes(ch, 2)
-
-        pkDict = Dict{Int64, audStrand}()
-        pks = findmaxima(view(ch, :, t))[1]
-
-        #pks = findpeaks(ch, t, minAmplitude)
-        
-        if !isempty(pks)
-            for f in pks
-                if ch[f, t] >= minAmplitude
-                    frs = aud.cfs[(f-1):(f+1), 2]
-                    amps = ch[(f-1):(f+1), t] ./ sum(ch[(f-1):(f+1), t] )
-                    fr = sum(frs .* amps)
-                    freqEnv = MutableLinkedList{Float64}(fr)
-                    ampEnv = MutableLinkedList{Float64}(ch[f, t])
-                    freqDeriv = MutableLinkedList{Float64}(0.0)
-                    pkSegment = audStrand(t, t, 0.0, freqEnv, ampEnv, freqDeriv)
-                    pkDict[f] = pkSegment
-                else
-                    pkDict[0] = audStrand(0, 0, 0.0, MutableLinkedList{Float64}(0.0), MutableLinkedList{Float64}(0.0), MutableLinkedList{Float64}(0.0))
-                end
-            end
-        else
-            pkDict[0] = audStrand(0, 0, 0.0, MutableLinkedList{Float64}(0.0), MutableLinkedList{Float64}(0.0), MutableLinkedList{Float64}(0.0))
-        end
-            peakList[t] = pkDict
-        
-    end
-    return peakList
-end
-function findpeaks(ch, t, threshold)
-    pks = MutableLinkedList{Int64}()
-    for f in axes(ch, 1)
-        
-        if (f > 1) && (f < size(ch, 1)) && (t > 1) && (t < size(ch, 2)) && (ch[f, t] >= threshold)
-            if (ch[f, t] > (.5*ch[f-1, t] + ch[f+1, t])) | (ch[f, t] > (.5*ch[f, t - 1] + .5*ch[f, t+1]))
-                push!(pks, f)
-            end
-        end
-    end
-
-    return collect(pks)
-end
-function appendLL!(s1::MutableLinkedList, s2::MutableLinkedList, alpha)
-
-    for el in s2
-        push!(s1, alpha*collect(s1)[end] + (1-alpha)*el)
-    end
-end
-function mergeSegments(s1, s2, alpha = .2)
-
-    if s1.t_end <= s2.t_start
-        s1.t_end = s2.t_end
-        appendLL!(s1.freq_envelope, s2.freq_envelope, alpha)
-        appendLL!(s1.amp_envelope, s2.amp_envelope, alpha)
-
-        
-        fdiff = s2.freq_envelope[1] - s1.freq_envelope[end]
-        setindex!(s2.freq_deriv, fdiff, 1)
-        appendLL!(s1.freq_deriv, s2.freq_deriv, 1)
-    end
-
-    return s1
-
-end
-
-function connectStrands(peakList, minLength, alpha, beta)
-    for t in axes(peakList, 1)
-        
-        for pk in peakList[t]
-            f = pk[1]
-            s1 = pk[2]
-            findLink(peakList, s1, t, f, alpha, beta)
-        end
-        
-    end
-    strandBook = Dict{Int, Pair{Int, audStrand}}()
-    
-    strands = 0
-    for window in peakList
-        while !isempty(window)
-            strands += 1
-            str = pop!(window)
-            if (str[2].t_end - str[2].t_start) >= minLength
-                strandBook[strands] = str
-            end
-        end
-    end
-
-    return strandBook
-
-end
-
-function findLink(peakList, s1, t, f, alpha, beta)
-
-    if t == length(peakList)
-        return s1
-    else 
-        check_f = f .+ [0, 1, -1, 2, -2]
-        f_scores = ones(Float64, length(check_f)) .* Inf
-        for i in eachindex(check_f)
-            if haskey(peakList[t+1], check_f[i])
-                s2 = peakList[t+1][check_f[i]]
-                slopeScore = getAngle(s1.freq_deriv[end], s2.freq_deriv[1]) / (0.5*π)
-                ampScore = (s1.amp_envelope[end]-s2.amp_envelope[1])/mean([s1.amp_envelope[end], s2.amp_envelope[1]])
-                f_scores[i] = (beta*abs(slopeScore)) + ((1-beta)*abs(ampScore))
-            else
-                f_scores[i] = Inf
-            end
-        end
-        
-        best = findmin(f_scores)
-
-        if best[1] < Inf
-            fbest = check_f[best[2]]
-            best_s2 = peakList[t+1][fbest]
-
-            if (t+1) == length(peakList)
-                return best_s2
-            else
-                newSeg = mergeSegments(s1, findLink(peakList, best_s2, t+1, fbest, alpha, beta), alpha)
-                delete!(peakList[t+1], fbest)
-                return newSeg
-            end
-
-            
-        else 
-            return s1
-        end
-    end
-
-end
-
-
 
 
 ### visualization functions
-export plotSpectrogram, plotAudio, plotDFT, plotFB, plotStrandBook
 
 
 function plotSpectrogram(aud; 
@@ -359,7 +231,7 @@ function plotSpectrogram(aud;
     tmax, 
     fmin = aud.cfs[1, 2], 
     fmax = aud.cfs[end, 2], 
-    maxbins = 500,
+    maxbins = 5000,
     fticks = 10,
     tticks = 10,
     zScale,  
@@ -367,22 +239,24 @@ function plotSpectrogram(aud;
     showNotes = false)
     
     if size(aud.channels, 1) > maxbins
-        newFs = aud.fs / ceil(size(aud.channels, 1) / maxbins)
-        aud = downsample(aud, newFs, false)
-        if tmax > aud.duration
-            tmax = aud.duration
-        end
+        ds = Int(ceil(size(aud.channels, 1) / maxbins))
+        channels = aud.channels[1:ds:end, :]
+        fs = aud.fs / ds
+       
+    else
+        channels = aud.channels
+        fs = aud.fs
     end
 
    
     frs = aud.cfs[:, 2]
-    tms = collect(1:size(aud.channels, 1)) ./ aud.fs
+    tms = collect(1:size(channels, 1)) ./ fs
  
-    fRes = frs[3]-frs[2]
+    fRes = hzToErb(frs[3])-hzToErb(frs[2])
     tRes = tms[3]-tms[2]
 
     #frs = [frs ; fRes+frs[end]]
-    append!(frs, fRes+frs[end])
+    append!(frs, erbToHz(fRes) + frs[end])
     append!(tms, tRes+tms[end])
     #tms = [tms ; tRes+tms[end]]
     #append!(Vector(frs), [frs[end] + fRes])
@@ -410,16 +284,18 @@ function plotSpectrogram(aud;
 
         CairoMakie.heatmap!(tms, 
         frs, 
-        aud.channels, 
-        colormap = cgrad(:haline, 20, scale = :exp10, rev = false))
-        Colorbar(f[:, 2], colormap = cgrad(:haline, 20, scale = :exp10))
+        channels, 
+        colormap = cgrad(:viridis, 20, scale = :exp10, rev = false))
+        Colorbar(f[:, 2], colormap = cgrad(:viridis, 20, scale = :exp10))
 
     else
         CairoMakie.heatmap!(tms, 
         frs, 
-        aud.channels,
-        colormap = cgrad(:haline, 20, rev = false))
-        Colorbar(f[:, 2], colormap = cgrad(:haline, 20))
+        channels)
+        Colorbar(f[:, 2])
+
+        #colormap = cgrad(:haline, 20, rev = false))
+        #Colorbar(f[:, 2], colormap = cgrad(:haline, 20))
 
     end
 
@@ -534,35 +410,7 @@ function plotChannels(channelRMS, showChannels, alpha, gap)
 
 end
 
-function plotStrandBook(strandBook, aud; tmin = 0, tmax = -1, fmin = 0, fmax = -1, logY = false)
-
-    if tmax == -1 
-        tmax = aud.duration
-    end
-
-    if fmax == -1
-        fmax = aud.cfs[end, 2]
-    end
-
-    f = plotSpectrogram(aud, tmin = tmin, tmax = tmax, fmin = fmin, fmax = fmax, fticks = 10, tticks = 10, zScale = "linear", logY = logY)
-
-    for i in eachindex(strandBook)
-        str = strandBook[i]
-        s = str[2]
-
-        freqs = collect(s.freq_envelope)
-        amps = collect(s.amp_envelope)
-        times = range(s.t_start, s.t_end, length(freqs)) ./ aud.fs
-        lines!(times, freqs, color = :red, linewidth = 3, alpha = amps)
-        #scatter!(times, freqs, color = :red, size = 1, alpha = amps)
-
-    end
-    f
-end
-
-
 ### utility functions
-export getAngle, windowAverages, mag, get_phase_shift, ifreq, mean_ifreq, norm_cols
 
 function windowAverages(aud, wgt, wl, ovlp)
     
@@ -574,6 +422,10 @@ function windowAverages(aud, wgt, wl, ovlp)
     
             for (i, wind) in enumerate(window)
                 channels[i, j] = mean(@view(aud[Int.(wind), j]))
+
+                if isnan(channels[i, j])
+                    channels[i, j] = 0
+                end
             end
         end
     else
@@ -583,6 +435,9 @@ function windowAverages(aud, wgt, wl, ovlp)
     
             for (i, wind) in enumerate(window)
                 channels[i, j] = mean(@view(aud[Int.(wind), j]), weights(@view(wgt[Int.(wind), j])))
+                if isnan(channels[i, j])
+                    channels[i, j] = 0
+                end
             end
         end
     end
@@ -591,6 +446,53 @@ function windowAverages(aud, wgt, wl, ovlp)
     return channels
 end
 
+function windowAverages(aud::Vector, wgt, wl, ovlp, mode = "mean")
+    
+   window = arraysplit(1:size(aud, 1), wl, ovlp)
+   channels = zeros(eltype(aud), length(window))
+ 
+    if isnothing(wgt)
+         if mode == "mean"
+            for (i, wind) in enumerate(window)
+
+                channels[i] = mean(@view(aud[Int.(wind)]))
+
+                if isnan(channels[i])
+                    channels[i] = 0
+                end
+            end
+        elseif mode == "median"
+            for (i, wind) in enumerate(window)
+
+                channels[i] = median(@view(aud[Int.(wind)]))
+
+                if isnan(channels[i])
+                    channels[i] = 0
+                end
+            end
+        end
+    else
+
+        if mode == "mean"
+            for (i, wind) in enumerate(window)
+                channels[i] = mean(@view(aud[Int.(wind)]), weights(@view(wgt[Int.(wind)])))
+                if isnan(channels[i])
+                    channels[i] = 0
+                end
+            end
+        elseif mode == "median"
+            for (i, wind) in enumerate(window)
+                channels[i] = median(@view(aud[Int.(wind)]), weights(@view(wgt[Int.(wind)])))
+                if isnan(channels[i])
+                    channels[i] = 0
+                end
+            end
+        end
+    end
+    
+   
+    return channels
+end
 
 #phase angle of complex value
 function getAngle(m1, m2)
@@ -602,34 +504,95 @@ function mag(a)
     sqrt(real(a)^2 + imag(a)^2)
 end
 
-
-function get_phase_shift(x1, x2)
-    x1p = transpose(x1 .^ (-1))
-    em = x2 * x1p
-    diags = div(size(em, 1) + size(em, 2) - 2, 2)
-    
-    for i in -diags:diags
-        em[diagind(em, i)] .= mean(diag(em, i))
-    end
-
-    em ./= size(em, 2)
-    return em
+function mag2(a)
+    real(a)^2 + imag(a)^2
 end
 
+function hzToErb(f)
+    erb = 21.4 * log10((4.37 * f / 1000) + 1)
+    return erb
+end
+
+function erbToHz(erb)
+    f = (10 ^ (erb / 21.4) - 1) * 1000 / 4.37 
+    return f
+end
+
+
+function get_phase_shift(x1::Vector{T}, x2::Vector{T}) where T <: Real
+    a = [ones(eltype(x1), length(x1), 1) x1]
+    beta = a \ x2
+    
+    return acos(beta[2])/pi 
+end
+
+function get_phase_shift(x1::Vector{T}, x2::Vector{T}) where T <: Complex
+    a = [ones(eltype(x1), length(x1), 1) x1]
+    beta = a \ x2
+    
+    return atan(imag(beta[2]), real(beta[2])) / pi
+end
+
+
+function phase_align(x1, x2) 
+    a = [ones(eltype(x1), length(x1), 1) x1]
+    beta =  a \ x2
+    
+    return a * beta
+end
 
 
 #Uses phase derivative to estimate instantaneous frequency of a sampled complex exponential. 
 #No phase unwrapping is required.
-function ifreq(x, fs)
+function ifreq(x::Vector, fs, wl) 
     y = x ./ mag.(x)
     freqs = zeros(Float32, size(y, 1))
     
     Threads.@threads for i in 2:(size(y, 1) - 1)
         freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
+        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
     end
 
     freqs[1] = freqs[2]
     freqs[end] = freqs[end - 1]
+
+    freqs .= runmean(freqs, wl)
+    return freqs
+end
+
+function ifreq(x::Matrix, fs, wl = 10)
+    y = x ./ (mag.(x) .+ eps())
+    freqs = zeros(Float32, size(y))
+    
+    Threads.@threads for j in axes(x, 2)
+        for i in 2:(size(y, 1) - 1)
+            freqs[i, j] = fs * imag(conj(y[i, j]) * .5 * (y[i + 1, j] - y[i - 1, j])) / (π*2) #* fs / ( 2 * π )
+            freqs[i, j] = (freqs[i, j] < 0) || (isnan(freqs[i, j])) ? 0 : freqs[i, j]
+        end
+        freqs[1, j] = freqs[2, j]
+        freqs[end, j] = freqs[end - 1, j]
+
+        freqs[:, j] .= runmean(@view(freqs[:, j]), wl)
+    end
+
+    
+    #replace!(x -> x < 0 )
+    return freqs
+end
+
+function ifreq(x::AbstractArray, fs, wl) 
+    y = x ./ mag.(x)
+    freqs = zeros(Float32, size(y, 1))
+    
+    Threads.@threads for i in 2:(size(y, 1) - 1)
+        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
+        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
+    end
+
+    freqs[1] = freqs[2]
+    freqs[end] = freqs[end - 1]
+
+    freqs .= runmean(freqs, wl)
 
     return freqs
 end
@@ -649,7 +612,7 @@ end
 
 #normalize columns of matrix
 function norm_cols(x, p = 2)
-    y = copy(x)
+    y = deepcopy(x)
     for j in axes(y, 2)
         y[:, j] = normalize!(y[:, j], p)
     end
@@ -658,12 +621,83 @@ end
 
 
 
+function synchrosqueeze(ifreqs,  amps::Matrix{T}, cfs, threshold) where T <: Real
+    squeezed = zeros(eltype(amps), size(ifreqs))
+    threshold *= maximum(amps)
+    fdiff = (cfs[2, 1] - cfs[1, 1])
+    Threads.@threads for t in axes(squeezed, 2)
+        for k in axes(squeezed, 1)
+            if amps[t, k] > threshold
+                newBin =  ((hzToErb(ifreqs[k, t]) - cfs[1, 1])/fdiff) + 1
 
+                if checkindex(Bool, 1:size(squeezed, 1), newBin) #&& (abs.(newBin - k) < 5) #&& (newBin != k)
+                    squeezed[floor(Int32, newBin), t] += amps[t, k] * (newBin - floor(newBin))
+                    squeezed[ceil(Int32, newBin), t] += amps[t, k] * (ceil(newBin) - newBin)
+                
+                end
+            end
+        
+        end
+    
+    end
+    return permutedims(squeezed)
+end
+
+function synchrosqueeze(ifreqs, amps::Matrix{T}, cfs, threshold) where T <: Complex
+    squeezed = zeros(eltype(amps), size(ifreqs))
+    threshold *= maximum(mag.(amps))
+    fdiff = (cfs[2, 1] - cfs[1, 1])
+    Threads.@threads for t in axes(squeezed, 2)
+        for k in axes(squeezed, 1)
+            if mag(amps[t, k]) > threshold
+                newBin =  ((hzToErb(ifreqs[k, t]) - cfs[1, 1])/fdiff) + 1
+
+                if checkindex(Bool, 1:size(squeezed, 1), newBin) #&& (abs.(newBin - k) < 5) #&& (newBin != k)
+                    squeezed[floor(Int32, newBin), t] += amps[t, k] * (newBin - floor(newBin))
+                    squeezed[ceil(Int32, newBin), t] += amps[t, k] * (ceil(newBin) - newBin)
+                
+                end
+            end
+        
+        end
+    
+    end
+    return permutedims(squeezed)
+end
+
+function synchrosqueeze_hpss(squeezed, wl)
+
+    squeezed = permutedims(squeezed)
+
+    Threads.@threads for t in axes(squeezed, 2)
+        squeezed[:, t] .-= runmin(@view(squeezed[:, t]), wl)
+    
+    end
+    squeezed = permutedims(squeezed)
+
+   return squeezed
+end
+
+
+function ispeak(tfd, threshold)
+
+    tfd = permutedims(tfd)
+    peaks = zeros(Bool, size(tfd))
+    minAmp = maximum(tfd) * threshold
+    Threads.@threads for t in axes(peaks, 2)
+        for k in 2:(size(peaks, 1) - 1)
+            peaks[k, t] = (tfd[k, t] > minAmp) && (tfd[k, t] > tfd[k - 1, t]) && (tfd[k, t] > tfd[k + 1, t])
+        end
+    end
+    tfd = permutedims(tfd)
+
+   return permutedims(peaks)
+end
 ### filterbank related data structures
-export audioRecord, audStrand
+export AudioRecord
 
 
-mutable struct audioRecord
+mutable struct AudioRecord
     cfs::Matrix{Float64}
     channels::Array{Float64}
     fs::Float64
@@ -672,20 +706,11 @@ mutable struct audioRecord
 end
 
 
-mutable struct audStrand
-    t_start::Int64
-    t_end::Int64
-    init_phase::Float64
-    freq_envelope::MutableLinkedList{Float64}
-    amp_envelope::MutableLinkedList{Float64}
-    freq_deriv::MutableLinkedList{Float64}
-end
-
 
 #=
-function copy(aud::audioRecord)
+function copy(aud::AudioRecord)
     
-    return audioRecord(copy(aud.cfs), copy(inst_amp), copy(aud.fs), copy(aud.duration), copy(aud.nchannels)) 
+    return AudioRecord(copy(aud.cfs), copy(inst_amp), copy(aud.fs), copy(aud.duration), copy(aud.nchannels)) 
 
 end
 =#
