@@ -111,14 +111,26 @@ function create_gt_cascade_filterBank(fmin, fmax, fs, bins, bandwidth)
     return fb
 end
 
-function applyFilterbank(s, fb)
+function applyFilterbank(s, fb; forwards_backwards = false)
     newNumChannels = size(fb.cfs, 1)
     splitAudio = Matrix{Float64}(undef, length(s), newNumChannels)
     Threads.@threads for j in axes(splitAudio, 2)
-        x = DSP.filt(fb.filters[j], s)
-        splitAudio[:, j] = x
+        #x = DSP.filt(fb.filters[j], s)
+        #splitAudio[:, j] = DSP.filt(fb.filters[j], s)
+        DSP.filt!(@view(splitAudio[:, j]), fb.filters[j], s)
     end
 
+    if forwards_backwards
+        sp = copy(splitAudio)
+        Threads.@threads for j in axes(sp, 2)
+            #x = DSP.filt(fb.filters[j], splitAudio[end:-1:1, j])
+            #splitAudio[:, j] = x[end:-1:1]
+            DSP.filt!(@view(sp[:, j]), fb.filters[j], splitAudio[end:-1:1, j])
+        end
+
+        return sp[end:-1:1, :]
+    end
+    
     return splitAudio
 end
 
@@ -148,6 +160,7 @@ end
 
 
 
+
 function getComplexGammatone(cf, fs, bandwidth, erbStep, Ngd)
     
     erb = bandwidth * erbWidth(cf)
@@ -163,9 +176,9 @@ function getComplexGammatone(cf, fs, bandwidth, erbStep, Ngd)
     transfer = B * PolynomialRatio([0.0, A, 4*A^2, A^3], [1.0]) * PolynomialRatio([1.0], [1.0, -A])^4 * PolynomialRatio(zd, [1.0])
     
     fr = freqresp(transfer, cf*2*π/fs)
-    frm = sqrt(real(fr)^2 + imag(fr)^2)
-   # frm=1
-    return transfer*(1/frm)
+    #frm = sqrt(real(fr)^2 + imag(fr)^2)
+    #frm=1
+    return transfer * (1/fr)
 end
 
 
@@ -188,7 +201,7 @@ function createComplexGTFilterBank(fmin, fmax, fs, bins, bandwidth, Ngd)
     return fb
 end
 
-function applyComplexFilterbank(s, fb, output = "envelopes")
+function applyComplexFilterbank(s, fb; forwards_backwards = true)
     newNumChannels = size(fb.cfs, 1)
     y = Matrix{ComplexF32}(undef, length(s), newNumChannels)
 
@@ -197,6 +210,18 @@ function applyComplexFilterbank(s, fb, output = "envelopes")
     
     
     end
+
+    if forwards_backwards
+        sp = copy(y)
+        Threads.@threads for j in axes(sp, 2)
+            #x = DSP.filt(fb.filters[j], splitAudio[end:-1:1, j])
+            #splitAudio[:, j] = x[end:-1:1]
+            DSP.filt!(@view(sp[:, j]), fb.filters[j], reverse(real.(y[:, j])))
+        end
+
+        return reverse(sp, dims = 1)
+    end
+    
 
     return y
 end

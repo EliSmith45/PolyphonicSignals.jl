@@ -83,181 +83,8 @@ using .TimeFrequencyTools
 
 ########## sliding window SSA with frequency channel filtering
 export ssa_windowed_peakchannels, ssa_windowed, mssa_windowed, link_comps, 
-    envelopes, update_hankel!, link_comps_sparse, params_longformat, trackchannels, track_crosschannels
-
-#=
-#Uses phase derivative to estimate instantaneous frequency of a sampled complex exponential. 
-#No phase unwrapping is required.
-function ifreqn(y::Vector{ComplexF32}, fs)
-    freqs = zeros(Float32, size(y, 1))
-    
-    Threads.@threads for i in 2:(size(y, 1) - 1)
-        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
-        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
-    end
-
-    freqs[1] = freqs[2]
-    freqs[end] = freqs[end - 1]
-
-    return freqs
-end
-
-function ifreq(x::Vector{T}, fs) where T >: Complex
-    y = x ./ mag.(x)
-    freqs = zeros(Float32, size(y, 1))
-    
-    Threads.@threads for i in 2:(size(y, 1) - 1)
-        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
-        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
-    end
-
-    freqs[1] = freqs[2]
-    freqs[end] = freqs[end - 1]
-
-    return freqs
-end
-
-function ifreq_sample(y, fs)
-    fs * imag(conj(y[2]) * .5 * (y[3] - y[1])) / (π*2) #* fs / ( 2 * π )
-end
-
-function ifreq(x::Matrix{T}, fs) where T >: Complex
-    y = x ./ (mag.(x) .+ eps())
-    freqs = zeros(Float32, size(y))
-    
-    Threads.@threads for j in axes(x, 2)
-        for i in 2:(size(y, 1) - 1)
-            freqs[i, j] = fs * imag(conj(y[i, j]) * .5 * (y[i + 1, j] - y[i - 1, j])) / (π*2) #* fs / ( 2 * π )
-            freqs[i, j] = (freqs[i, j] < 0) || (isnan(freqs[i, j])) ? 0 : freqs[i, j]
-        end
-    end
-
-    freqs[1, :] .= @view(freqs[2, :])
-    freqs[end, :] .= @view(freqs[end - 1, :])
-    #replace!(x -> x < 0 )
-    return freqs
-end
-
-
-
-function ifreq(x::AbstractArray, fs)
-    y = x ./ mag.(x)
-    freqs = zeros(Float32, size(y, 1))
-    
-    Threads.@threads for i in 2:(size(y, 1) - 1)
-        freqs[i] = fs * imag(conj(y[i]) * .5 * (y[i + 1] - y[i - 1])) / (π*2) #* fs / ( 2 * π )
-        freqs[i] = (freqs[i] < 0) || (isnan(freqs[i])) ? 0 : freqs[i]
-    end
-
-    freqs[1] = freqs[2]
-    freqs[end] = freqs[end - 1]
-
-    return freqs
-end
-
-#magnitude of complex value
-function mag(a)
-    sqrt(real(a)^2 + imag(a)^2)
-end
-
-function mag2(a)
-    real(a)^2 + imag(a)^2
-end
-
-function threshold_power(val, threshold)
-    mag(val) < threshold ? 0 : val
-end
-
-
-
-function windowAverages(aud, wgt, wl, ovlp)
-    
-    channels = zeros(eltype(aud), length(arraysplit(collect(1:size(aud, 1)), wl, ovlp)), size(aud, 2))
-
-    if isnothing(wgt)
-        Threads.@threads for j in axes(channels, 2)
-            window = arraysplit(1:size(aud, 1), wl, ovlp)
-    
-            for (i, wind) in enumerate(window)
-                channels[i, j] = mean(@view(aud[Int.(wind), j]))
-
-                if isnan(channels[i, j])
-                    channels[i, j] = 0
-                end
-            end
-        end
-    else
-
-        Threads.@threads for j in axes(channels, 2)
-            window = arraysplit(1:size(aud, 1), wl, ovlp)
-    
-            for (i, wind) in enumerate(window)
-                channels[i, j] = mean(@view(aud[Int.(wind), j]), weights(@view(wgt[Int.(wind), j])))
-                if isnan(channels[i, j])
-                    channels[i, j] = 0
-                end
-            end
-        end
-    end
-    
-   
-    return channels
-end
-
-
-function windowAverages(aud::Vector, wgt, wl, ovlp, mode = "mean")
-    
-    window = arraysplit(1:size(aud, 1), wl, ovlp)
-    channels = zeros(eltype(aud), length(window))
-  
-     if isnothing(wgt)
-          if mode == "mean"
-             for (i, wind) in enumerate(window)
- 
-                 channels[i] = mean(@view(aud[Int.(wind)]))
- 
-                 if isnan(channels[i])
-                     channels[i] = 0
-                 end
-             end
-         elseif mode == "median"
-             for (i, wind) in enumerate(window)
- 
-                 channels[i] = median(@view(aud[Int.(wind)]))
- 
-                 if isnan(channels[i])
-                     channels[i] = 0
-                 end
-             end
-         end
-     else
- 
-         if mode == "mean"
-             for (i, wind) in enumerate(window)
-                 channels[i] = mean(@view(aud[Int.(wind)]), weights(@view(wgt[Int.(wind)])))
-                 if isnan(channels[i])
-                     channels[i] = 0
-                 end
-             end
-         elseif mode == "median"
-             for (i, wind) in enumerate(window)
-                 channels[i] = median(@view(aud[Int.(wind)]), weights(@view(wgt[Int.(wind)])))
-                 if isnan(channels[i])
-                     channels[i] = 0
-                 end
-             end
-         end
-     end
-     
-    
-     return channels
- end
-
- 
-=#
-function mag2(a)
-    real(a)^2 + imag(a)^2
-end
+    envelopes, update_hankel!, link_comps_sparse, params_longformat, trackchannels,
+    track_crosschannels, trackchannels_flux
 
 
 function update_hankel!(hk, xk, embeddingDim, wl)
@@ -604,7 +431,7 @@ end
 
 
 ############ NLMS and trajectory smoothing stuff
-
+using Flux
 #export trackchannels, track_crosschannels
 
 
@@ -624,24 +451,95 @@ function update_NMLS!(predictions, errors, coefs, x, v, mu, e)
 
 end
 
-function update_NMLS_multi!(predictions, errors, coefs, crossCoefs, x, v, ts, te, plan)
-    
-   #make prediction
-   predictions[te + 1] = dot(crossCoefs, @view(x[ts:te]))
+# doesn't record predictions or error. Only updates the coeffients
+function update_NMLS!(coefs, x, y, mu, e)
 
-   #calculate error
-   errors[te + 1] = (x[te + 1] - predictions[te + 1])
-  
-   #adjust coefficients according to instantaneous gradient of mean square error
-   crossCoefs .+= ((plan.mu * conj(errors[te + 1])) / (v + plan.e) .* @view(x[ts:te]))
-  
+    #calculate error
+    error = (y - dot(coefs, x))
+   
+    #adjust coefficients according to instantaneous gradient of mean square error
+    coefs .+= ((mu * conj(error)) / (norm(x) + e) .* x)
+
 end
 
 
 
+function trackchannels_flux(tfd, cfs, fs; mu = .1, e = eps(), p = 10, minAmplitude = .01, ds = 1, wl = 100)
+    
+    tfd = @view(tfd[1:ds:end, :])
+    nWindows = Int(floor((size(tfd, 1) - p )/ wl)) 
+  
+    power = mag2.(tfd)
+    predictions = similar(tfd)
+    errors = similar(tfd)
+   
+      
+   
+    Threads.@threads for k in axes(power, 2)
+        power[:, k] .= (runmean(@view(power[:, k]), p))
+    end
+    powerThreshold = maximum(power) * (minAmplitude ^ 2)
+
+  
+    #coefs = zeros(ComplexF32, p, size(tfd, 2))
+
+ 
+    #=
+    for j in axes(coefs, 2)
+        for i in axes(coefs, 1)
+            coefs[i, j] = (1 / p) * cispi(-(i - p - 1) * 2 * ds * cfs[j, 2] / fs)
+        end
+    end
 
 
-function trackchannels(tfd; mu, e, p, minAmplitude, ds = ds, saveEvery = 100);
+=#
+
+#=
+    parameters = [Dense(p => 1; bias = false) for i in axes(tfd, 2)]
+    loss_mse(m, x, y) = Flux.Losses.mse(m(x), y)
+    opt = Descent(mu)
+    prs = Flux.params()
+    parameters = [Dense(p => 1; bias = false) for i in axes(tfd, 2)]
+  =#
+    parameters = [Conv((1, p), 1 => 1; bias = false) for i in axes(tfd, 2)]
+    loss_mse(m, x, y) = Flux.Losses.mse(m(x), y)
+    opt = Descent(mu)
+    prs = Flux.params()
+    parameters = [Dense(p => 1; bias = false) for i in axes(tfd, 2)]
+  
+    
+    for w in (p + 1):wl:(size(tfd, 1) - p - 1)
+        Threads.@threads for k in axes(tfd, 2)
+            
+            #=
+            for t in 0:(wl - 1)
+                if power[w + t, k] > powerThreshold
+
+                    prs = Flux.params(parameters[k])
+                    gs = Flux.gradient(prs) do
+                        loss_mse(parameters[k], @view(tfd[(w + t - p):(w + t - 1), k]), tfd[w + t, k])
+                    end
+
+                    Flux.Optimise.update!(opt, prs, gs)
+                    predictions[w + t, k] = parameters[k](@view(tfd[(w + t - p):(w + t - 1), k]))[1]
+                
+                end
+
+
+            end
+        =#
+            
+        end
+        #println(t)
+    end
+   
+    #predictions[1:p, :] .= 0
+    #errors[1:p, :] .= 0
+    return predictions#, errors #, allCoefs
+         
+end
+
+function trackchannels(tfd, cfs, fs; mu, e, p, minAmplitude, ds = ds, saveEvery);
     
     tfd = @view(tfd[1:ds:end, :])
     nWindows = Int(floor((size(tfd, 1) - p )/ saveEvery)) 
@@ -657,6 +555,12 @@ function trackchannels(tfd; mu, e, p, minAmplitude, ds = ds, saveEvery = 100);
     threshold = maximum(power) * minAmplitude
     coefs = zeros(ComplexF32, p, size(tfd, 2))
 
+    for j in axes(coefs, 2)
+        for i in axes(coefs, 1)
+            coefs[i, j] = (1 / p) * cispi(-(i - p - 1) * 2 * ds * cfs[j, 2] / fs)
+        end
+    end
+
     for w in 1:(nWindows - 1) #saveEvery:(size(tfd, 1) - plan.p)
         Threads.@threads for k in axes(tfd, 2)
             for t in ((w - 1) * saveEvery + 1):(w * saveEvery)
@@ -671,132 +575,82 @@ function trackchannels(tfd; mu, e, p, minAmplitude, ds = ds, saveEvery = 100);
         #println(t)
     end
    
+    predictions[1:p, :] .= 0
+    errors[1:p, :] .= 0
     return predictions, errors #, allCoefs
          
 end
 
-#export track_crosschannels
-function track_crosschannels(tfd; mu, e, p, minPrediction, minAmplitude, ds = ds, saveEvery = 100);
+
+
+export track_crosschannels
+function track_crosschannels(tfd, cfs, fs; mu, e, p, minAmplitude, ds = ds, wl = 100);
     
     tfd = @view(tfd[1:ds:end, :])
-    nWindows = Int(floor((size(tfd, 1) - p )/ saveEvery)) 
+    #nWindows = Int(floor((size(tfd, 1) - p )/ saveEvery)) 
     power = mag2.(tfd)
     
-    coefs = zeros(eltype(tfd), size(tfd, 2), p)
-
-    #=
-    coefs = Dict{Int, Vector{eltype(tfd)}}()
-    whichChannels = Dict{Int, Vector{Int}}()
-    whichCoefs = Dict{Int, Vector{Int}}()
-    =#
-    channelIsActive = zeros(Bool, size(tfd, 2))
-    coefIsActive = zeros(Bool, size(tfd, 2))
-    coefCov =  zeros(eltype(tfd), size(tfd, 2), size(tfd, 2))
-    coefChannelCov =  zeros(eltype(tfd), size(tfd, 2), size(tfd, 2))
-
+    w1 = zeros(eltype(tfd), p, size(tfd, 2))
+    w2 = zeros(eltype(tfd), size(tfd, 2), size(tfd, 2))
+    w1Active = Vector{Int64}()
+    for j in axes(w1, 2)
+        for i in axes(w1, 1)
+            w1[i, j] = (1 / p) * cispi(-(i - p - 1) * 2 * ds * cfs[j, 2] / fs)
+        end
+    end
+    
+   
     Threads.@threads for k in axes(power, 2)
         power[:, k] .= (runmean(@view(power[:, k]), p))
     end
+    powerThreshold = maximum(power) * (minAmplitude ^ 2)
 
-    tfd = permutedims(tfd)
-    power = permutedims(power)
-    signalComps = similar(tfd)
-    predictions = similar(tfd)
-    errors = copy(tfd)
 
-    ampThreshold = maximum(power) * sqrt(minAmplitude)
-
-    for t in 1:(size(tfd, 2) - p)
-        salientChannels = findall(x -> x > ampThreshold, @view(tfd[k, t + p]))
-        for k in salientChannels
-            if channelIsActive[k]
-                    
-                if length(whichCoefs[k]) > 1
-                    preds = @view(coefs[whichCoefs[k], :]) \  @view(tfd[k, t:(t + p - 1)]) #(conj.(@view(coefs[whichCoefs[k], :])) * @view(tfd[k, t:(t + p - 1)]))
-                    signalComps[whichCoefs[k], t + p] .+= preds
-                    predictions[k, t + p] = sum(preds)
-                    errors[k, t + p] -= predictions[k, t + p]
+    #tfd = permutedims(tfd)
+    #power = permutedims(power)
     
-
-                else
-                    signalComps[c, t + p] += (conj.(@view(coefs[c, :])) * @view(tfd[k,  t:(t + p - 1)]))
-                    predictions[k, t + p] = sum(preds)
-                    errors[k, t + p] -= predictions[k, t + p]
-        
-                
-                end
-
-            else
-                channelIsActive[k] = true
-
-            end
-
-
-        for c in eachindex(coefIsActive)
-            for k in whichChannels[c]
-                if length(whichCoefs[k]) > 1
-                    
-                    preds = @view(coefs[whichCoefs[k], :]) \  @view(tfd[k, (t - p):(t + p)]) #(conj.(@view(coefs[whichCoefs[k], :])) * @view(tfd[k, t:(t + p - 1)]))
-                    signalComps[whichCoefs[k], t] .+= preds
-                    predictions[k, t] = sum(preds)
-                    errors[k, t] -= predictions[k, t]
+    pred_single = zeros(eltype(tfd), size(tfd, 2), size(tfd, 2))
+    deconvolved = zeros(eltype(tfd), size(tfd))
+    reconvolved = zeros(eltype(tfd), size(tfd))
+    residual = copy(tfd)
     
-
-                else
-                    signalComps[c, t] += (conj.(@view(coefs[c, :])) * @view(tfd[k, (t - p):(t + p)]))
-                    predictions[k, t] = sum(preds)
-                    errors[k, t] -= predictions[k, t]
-        
-                
-                end
-               
-            end
-        end
-    end
-        #= 
-        predictions_unrefined .= coefs * @view(tfd[t:(t + p - 1), k])
-        residuals_unrefined .=  @view(tfd[t + p, :])
-        channelMag .= mag.(residuals_unrefined)
-        total = sum(channelMag)
-        threshold = total * minAmplitude
-        
-        while total > threshold
-            m = argmax(channelMag)
-            b = argmin(@view(predictions_unrefined[:, m]))
-            included[b] = true
-            residuals_unrefined .-= @view(predictions_unrefined[b, :])
-            channelMag .= mag.(residuals_unrefined)
-            total = sum(channelMag)
-        end
-        
-        
-        for i in eachindex(included)
-            if !included
-                predictions_unrefined[i, :] .= 0
-                #update_NMLS!(@view(predictions[:, k]), @view(errors[:, k]), @view(coefs[:, k]),  @view(tfd[:, k]), power[t + plan.p - 1, k], t, t + plan.p - 1, plan)
-            end
-        end
-
-        Threads.@threads for k in axes(crossCoefs, 2)
-            channelCrossCov = predictions_unrefined' * predictions_unrefined
-            if included
-                update_NMLS!(@view(predictions[:, k]), @view(errors[:, k]), @view(coefs[:, k]),  @view(tfd[:, k]), power[t + plan.p - 1, k], t, t + plan.p - 1, plan)
-            else
-
-            end
-            predictions_unrefined[i, :] .= 0
-            update_NMLS_multi!(@view(predictions[:, k]), @view(errors[:, k]), @view(coefs[:, k]), @view(crossCoefs[:, k]),  @view(tfd[:, k]), power[t + plan.p - 1, k], t, t + plan.p - 1, plan)
+    for w in (p + 1):wl:(size(tfd, 1) - p)
+        println(w)
+        Threads.@threads for k in w1Active
             
-            
+            mul!(@view(pred_single[:, k]), (@view(tfd[(w - p):(w - 1), :]))', @view(w1[:, k]))
+            relu!(@view(pred_single[:, k]), mag.(@view(tfd[w, :])))
+            deconvolved[w, k] = sum(@view(pred_single[:, k]))
+            update_NMLS!(@view(w1[:, k]), @view(deconvolved[(w - p):(w - 1), k]), deconvolved[w, k], mu, e)
+
         end
-    end
+
+        #=
+        mul!(@view(reconvolved[:, w]), w2, @view(deconvolved[:, w])) 
+        residual[:, w] .-= @view(reconvolved[:, w])
         
-    
-    
+        Threads.@threads for k in w1Active
+            for m in axes(w2, 1)
+                w2[m, k] = (mu + conj(residual[m, w])) / (e + deconvolved[k, w]) * pred_single[m, k]
+            end
 
+        end
+        =#
 
-    return predictions, errors, coefs
-=#
+        mx = findmaxima(@view(power[w, :]))
+        while !isempty(mx[1])
+            loc = pop!(mx[1])
+            height = pop!(mx[2])
+            if (height > powerThreshold) && (mag(residual[w, loc]) > powerThreshold)
+                append!(w1Active, loc)
+            end
+        end
+
+    end
+      
+   
+
+    return deconvolved, reconvolved, residual
 end
 
 #export dft_matrix, ar_spectrum
@@ -828,98 +682,23 @@ mutable struct NLMSParam
     minAmplitude::Float64
 end
 
+
+#### MCMC/simulated annealing type optimization to estimate spectral profiles of each source and their
+#activations at each point in time. 
+
+function initSpectralProfile(h, p)
+    spectralProfile{ComplexF32}(zeros(h, p), zeros(h, h), Dict{Int, Vector}(), Dict{Int, Vector}())
 end
 
-#### component extraction
-#=
-export track_components
-
-
-function track_components(tfd, fs; timeres, minLength, minAmplitude, burnin)
-
-   
-    wl = Int(round(timeres * fs))
-    nWindows = Int(floor(size(tfd, 1) / wl))
-    times = 1:wl
-    ml = Int(round(minLength * fs))
-    amps = mag.(tfd)
-   
-    tStarts = zeros(Int64, size(tfd, 2))
-    strands = Dict{Tuple{Int64, Int64}, Matrix{Float32}}()
-
-    inactive = [t*-rue for i in axes(tfd, 2)]
-    #newlyActive = [false for i in axes(tfd, 2)]
-    #newlyEnded = [false for i in axes(tfd, 2)]
-   
-    for w in 1:nWindows
-        times = ((w - 1)*wl + 1):(w * wl)
+ 
+mutable struct spectralProfile{T}
     
-        meanAmps = mean(@view(amps[times, :]), dims = 1)
-        threshold = maximum(meanAmps) * minAmplitude
-      
-        println(w)
-        for k in axes(tfd, 2)
-        
-            if inactive[k]
-                if meanAmps[k]  > threshold
-
-                    #newlyActive[k] = true
-                    inactive[k] = false
-                    tStarts[k] = times[1]
-                end
-            else
-                if meanAmps[k] < threshold
-                    #newlyEnded[k] = true
-                    inactive[k] = true
-        
-                    #ts = tStarts[k]:times[end]
-                  
-                    if  (times[end] - tStarts[k]) > ml
-                        strands[(tStarts[k], k)] = [((tStarts[k]:times[end]) ./ fs) ifreq(@view(tfd[tStarts[k]:times[end], k]), fs) @view(amps[tStarts[k]:times[end], k])]
-                    end
-                    
-                    tStarts[k] = 0
-                end
-            end
-
-        end
-
-
-        for k in axes(tfd, 2)
-            if !inactive[k]
-                *
-
-        end
-    end
-
-    for k in axes(tfd, 2)
-        if !inactive[k] 
-            #ts = collect(tStarts[k]:times[end]) 
-            if (times[end] - tStarts[k]) > ml
-                strands[(tStarts[k], k)] = [((tStarts[k]:times[end]) ./ fs) ifreq(@view(tfd[tStarts[k]:times[end], k]), fs) @view(amps[tStarts[k]:times[end], k])]
-        
-            end
-        end
-    end
-
-
-    return strands
-end
-
-
-
-
-mutable struct ComponentTracker{T}
-    
-    tStart::Int64
-    tEnd::Int64
-    signal::Vector{T}
+    autoCoefs::Matrix{T}
+    crossCoefs::Matrix{T}
+    f0::Dict{Int, Vector}
+    a0::Dict{Int, Vector}
 
 end
 
 
-
-
 end
-=#
-#end

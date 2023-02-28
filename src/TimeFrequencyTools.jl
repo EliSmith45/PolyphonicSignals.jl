@@ -14,22 +14,24 @@ using Revise
 export getSongMono, compress_max!, downsample, clipAudio, createSignalFromInstFA, sampleCosine, 
     createEnvelope, midEarHighPass!, getSTFT, getPowerSpectrum, freq_reassignment_direction, 
     envelope_AC_DC, windowedSignal, plotSpectrogram, plotAudio, plotDFT, plotFB, plotStrandBook, 
-    getAngle, windowAverages, mag, mag2, get_phase_shift, ifreq, mean_ifreq, norm_cols,  phase_align, 
-    synchrosqueeze, synchrosqueeze_hpss, ispeak, hzToErb, erbToHz
+    getAngle, windowAverages, mag, mag2, get_phase_shift, ifreq, mean_ifreq, freqresponses, norm_cols,  phase_align, 
+    synchrosqueeze, synchrosqueeze_hpss, ispeak, hzToErb, erbToHz, nonlinearSmooth, nonlinearSmooth!
 
 
 export AudioRecord
 
 
-function getSongMono(fname, sTime, eTime)
+function getSongMono(fname, sTime, eTime, fs)
 
-    song, fs = wavread(fname)
-    s_start = Int(sTime * fs) + 1
-    s_end = Int(eTime * fs)
+    song, fs_old = wavread(fname)
+    s_start = Int(sTime * fs_old) + 1
+    s_end = Int(eTime * fs_old)
     song = song[s_start:s_end, :]
     song = (song[:, 1] .+ song[:, 2]) / 2
 
-    return AudioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
+    ds = round(fs / fs_old, digits = 1)
+    song = resample(song, ds)
+    return AudioRecord([0.0 0.0; 0.0 0.0], song, ds * fs_old, round(length(song)/fs, digits = 3), 1)
 
 end
 
@@ -46,6 +48,7 @@ function compress_max!(aud, minMult, maxMult)
 
 end
 
+#=
 function downsample(audio::AudioRecord, newFs)
     
 
@@ -80,7 +83,9 @@ function downsample(audio::AudioRecord, newFs)
 
     
 end
+=#
 
+#clip a segment of an AudioRecord 
 function clipAudio(aud, sTime, eTime)
     song = aud.channels
     fs = aud.fs
@@ -107,21 +112,35 @@ function exp_sawtooth_envelope(len, decay, period)
     return env
 end
 
+function createSignalFromInstFA(frequencies, amplitudes, fs, compression)
+
+    frequencies = convert.(eltype(frequencies), DSP.resample(frequencies, compression, dims = 1))
+    amplitudes = convert.(eltype(amplitudes), DSP.resample(amplitudes, compression, dims = 1))
+    song = sampleCosine(frequencies, amplitudes, fs * compression)
+    s = AudioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
+    
+    return s
+end
+
 function createSignalFromInstFA(frequencies, amplitudes, fs)
 
+    #frequencies = DSP.resample(frequencies, compression, dims = 1)
+    #amplitudes = DSP.resample(amplitudes, compression, dims = 1)
     song = sampleCosine(frequencies, amplitudes, fs)
     s = AudioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
     
     return s
 end
 
-function sampleCosine(frequencies, amplitudes, fs)
-    song = zeros(size(frequencies, 1))
 
+function sampleCosine(frequencies, amplitudes, fs)
+    song = zeros(eltype(frequencies), size(frequencies, 1))
+
+    phases = cumsum(frequencies .* ((2 * π) / fs), dims = 1)
     for j in axes(frequencies, 2)
-        for t in eachindex(song)
-            song[t] +=  amplitudes[t, j] * cos((2 * π * frequencies[t, j]) * t / fs)
-        end
+       
+        song .+=  amplitudes[:, j] .* cos.((phases[:, j]))
+        
     end
 
     return song
@@ -198,7 +217,6 @@ function freq_reassignment_direction(ifreq)
     return reassignment
 end
 
-import LinearAlgebra.dot
 
 function envelope_AC_DC(tfd, wl, step)
     nWindows = Int(div(size(tfd, 1) - wl, step))
@@ -494,6 +512,40 @@ function windowAverages(aud::Vector, wgt, wl, ovlp, mode = "mean")
     return channels
 end
 
+#smooth a time-frequency distribution nonlinearly by estamating instantaneous frequency and amplitude envelope
+#of each channel, low pass filtering those values, and then resampling complex sinusoids in each channel using 
+#the estimated amplitude envelope and phase (found by taking the cumulative sum of frequency), assuming an 
+#initial phase of 0.
+function nonlinearSmooth(signal, magWindow, freqWindow)
+
+    m = mag.(signal)
+    fr = ifreq(signal, 1)
+    s = copy(signal)
+    Threads.@threads for j in axes(m, 2)
+        m[:, j] .= runmean(@view(m[:, j]), magWindow)
+        fr[:, j] .= cumsum(runmean(@view(fr[:, j]), freqWindow))
+        s[:, j] .= @view(m[:, j]) .* cispi.(2 .* @view(fr[:, j]))
+    end
+
+    s
+end
+
+
+function nonlinearSmooth!(signal, magWindow, freqWindow)
+
+    m = mag.(signal)
+    fr = ifreq(signal, 1)
+
+    for j in axes(m, 2)
+        m[:, j] .= runmean(@view(m[:, j]), magWindow)
+        fr[:, j] .=  cumsum(runmean(@view(fr[:, j]), freqWindow))
+        signal[:, j] .= @view(m[:, j]) .*  cispi.(2 .* @view(fr[:, j]))
+    end
+
+
+end
+
+
 #phase angle of complex value
 function getAngle(m1, m2)
     θ = atan((m1-m2) / (1 + m1*m2))
@@ -507,6 +559,78 @@ end
 function mag2(a)
     real(a)^2 + imag(a)^2
 end
+
+
+
+export thresholder, thresholder!
+
+function thresholder(val::T, threshold::Number) where T <: Real
+    val < threshold ? 0.0 : val
+end
+
+function thresholder!(vals::AbstractArray{T}, threshold::Number) where T <: Real
+   
+    Threads.@threads for i in eachindex(vals)
+        if vals[i] < threshold
+           vals[i] = 0
+        end
+    end
+end
+
+function thresholder!(vals::AbstractArray{T}, threshold::AbstractArray) where T <: Real
+   
+    Threads.@threads for i in eachindex(vals)
+        if vals[i] < threshold[i]
+           vals[i] = 0
+        end
+    end
+end
+
+function thresholder!(x::AbstractArray{T}, vals::AbstractArray{T}, threshold::Number) where T <: Real
+   
+    Threads.@threads for i in eachindex(vals)
+        if vals[i] < threshold
+            x[i] = 0
+        else
+            x[i] = vals[i]
+        end
+    end
+end
+
+
+function thresholder(val::T, threshold::Number) where T <: Complex
+    mag(val) < threshold ? 0 : val
+end
+
+function thresholder!(vals::AbstractArray{T}, threshold::Number) where T <: Complex
+   
+    Threads.@threads for i in eachindex(vals)
+        if mag(vals[i]) < threshold
+           vals[i] = 0
+        end
+    end
+end
+
+function thresholder!(x::AbstractArray{T}, vals::AbstractArray{T}, threshold::Number) where T <: Complex
+   
+    Threads.@threads for i in eachindex(vals)
+        if mag(vals[i]) < threshold
+            x[i] = 0
+        else
+            x[i] = vals[i]
+        end
+    end
+end
+
+function thresholder!(vals::AbstractArray{T}, threshold::AbstractArray) where T <: Complex
+   
+    Threads.@threads for i in eachindex(vals)
+        if mag(vals[i]) < threshold[i]
+           vals[i] = 0
+        end
+    end
+end
+
 
 function hzToErb(f)
     erb = 21.4 * log10((4.37 * f / 1000) + 1)
@@ -610,6 +734,25 @@ function mean_ifreq(x, fs, len)
 end
 
 
+#get pairwise frequency responses between each filter (frequency response of filter i at the center frequency of filter j)
+function freqresponses(fb, fs)
+    freqr = zeros(ComplexF32, length(fb.filters), length(fb.filters))
+    
+    Threads.@threads for j in axes(freqr, 2)
+        freqr[:, j] .= freqresp(fb.filters[j], fb.cfs[:, 2] .* (2 * π) ./ fs)
+        #freqr[j, j] = 0 
+    end
+
+    #probs = copy(freqr)
+    #for i in 2:order
+    #    freqr[:, j] 
+
+    #end
+
+    return freqr
+end
+
+
 #normalize columns of matrix
 function norm_cols(x, p = 2)
     y = deepcopy(x)
@@ -621,16 +764,16 @@ end
 
 
 
-function synchrosqueeze(ifreqs,  amps::Matrix{T}, cfs, threshold) where T <: Real
+function synchrosqueeze(ifreqs,  amps::Matrix{T}, cfs; threshold = .01, maxdist = 10) where T <: Real
     squeezed = zeros(eltype(amps), size(ifreqs))
-    threshold *= maximum(amps)
+    tr = threshold * maximum(amps)
     fdiff = (cfs[2, 1] - cfs[1, 1])
     Threads.@threads for t in axes(squeezed, 2)
         for k in axes(squeezed, 1)
-            if amps[t, k] > threshold
+            if amps[t, k] > tr
                 newBin =  ((hzToErb(ifreqs[k, t]) - cfs[1, 1])/fdiff) + 1
 
-                if checkindex(Bool, 1:size(squeezed, 1), newBin) #&& (abs.(newBin - k) < 5) #&& (newBin != k)
+                if checkindex(Bool, 1:size(squeezed, 1), newBin) && (abs(newBin - k) < maxdist) #&& (newBin != k)
                     squeezed[floor(Int32, newBin), t] += amps[t, k] * (newBin - floor(newBin))
                     squeezed[ceil(Int32, newBin), t] += amps[t, k] * (ceil(newBin) - newBin)
                 
@@ -643,16 +786,16 @@ function synchrosqueeze(ifreqs,  amps::Matrix{T}, cfs, threshold) where T <: Rea
     return permutedims(squeezed)
 end
 
-function synchrosqueeze(ifreqs, amps::Matrix{T}, cfs, threshold) where T <: Complex
+function synchrosqueeze(ifreqs, amps::Matrix{T}, cfs; threshold = .01, maxdist = 10) where T <: Complex
     squeezed = zeros(eltype(amps), size(ifreqs))
-    threshold *= maximum(mag.(amps))
+    tr = threshold * maximum(mag.(amps))
     fdiff = (cfs[2, 1] - cfs[1, 1])
     Threads.@threads for t in axes(squeezed, 2)
         for k in axes(squeezed, 1)
-            if mag(amps[t, k]) > threshold
+            if mag(amps[t, k]) > tr
                 newBin =  ((hzToErb(ifreqs[k, t]) - cfs[1, 1])/fdiff) + 1
 
-                if checkindex(Bool, 1:size(squeezed, 1), newBin) #&& (abs.(newBin - k) < 5) #&& (newBin != k)
+                if checkindex(Bool, 1:size(squeezed, 1), newBin) && (abs(newBin - k) < maxdist) #&& (newBin != k)
                     squeezed[floor(Int32, newBin), t] += amps[t, k] * (newBin - floor(newBin))
                     squeezed[ceil(Int32, newBin), t] += amps[t, k] * (ceil(newBin) - newBin)
                 
