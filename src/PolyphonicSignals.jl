@@ -22,6 +22,7 @@ include("./MorphologicalComponentsFunctions.jl")
 include("./AdaptiveSingularFilterBank.jl")
 include("./neuronalNets.jl")
 
+
 #export from time-frequency analysis module 
 export getSongMono, compress_max!, downsample, clipAudio, createSignalFromInstFA, sampleCosine, 
     createEnvelope, midEarHighPass!, getSTFT, getPowerSpectrum, freq_reassignment_direction, 
@@ -32,7 +33,7 @@ export getSongMono, compress_max!, downsample, clipAudio, createSignalFromInstFA
 
 
 export create_gt_cascade_filterBank, applyFilterbank, getComplexGammatone, createComplexGTFilterBank, 
-    applyComplexFilterbank, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, erbWidth,
+    applyComplexFilterbank, applyComplexFilterbank!, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, erbWidth,
     getErbBins, biquadParam #gt_cascaded_filterbank
 
 
@@ -54,7 +55,8 @@ export ssa_windowed_peakchannels, ssa_windowed, mssa_windowed, link_comps,
 
 
 #export from NeuronalNets
-export lca_iir, lca_iir2
+export Dnn
+
 
 #import modules
 using .TimeFrequencyTools

@@ -18,7 +18,7 @@ using .TimeFrequencyTools
 using DSP, StatsBase, Peaks, DataStructures, LinearAlgebra, RollingFunctions
 
 export create_gt_cascade_filterBank, applyFilterbank, getComplexGammatone, createComplexGTFilterBank, 
-    applyComplexFilterbank, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, erbWidth,
+    applyComplexFilterbank, applyComplexFilterbank!, gt_complex_filterbank, meddis_IHC, getGTFreqResponse, erbWidth,
     getErbBins, biquadParam #gt_cascaded_filterbank
 
 
@@ -201,13 +201,12 @@ function createComplexGTFilterBank(fmin, fmax, fs, bins, bandwidth, Ngd)
     return fb
 end
 
-function applyComplexFilterbank(s, fb; forwards_backwards = true)
+function applyComplexFilterbank(s, fb; forwards_backwards = true, ds = 1)
     newNumChannels = size(fb.cfs, 1)
     y = Matrix{ComplexF32}(undef, length(s), newNumChannels)
 
     Threads.@threads for j in axes(y, 2)
        DSP.filt!(@view(y[:, j]), fb.filters[j], s)
-    
     
     end
 
@@ -216,14 +215,39 @@ function applyComplexFilterbank(s, fb; forwards_backwards = true)
         Threads.@threads for j in axes(sp, 2)
             #x = DSP.filt(fb.filters[j], splitAudio[end:-1:1, j])
             #splitAudio[:, j] = x[end:-1:1]
-            DSP.filt!(@view(sp[:, j]), fb.filters[j], reverse(real.(y[:, j])))
+            DSP.filt!(@view(sp[:, j]), fb.filters[j], reverse(real.(@view(y[:, j]))))
         end
 
-        return reverse(sp, dims = 1)
+        return reverse( @view(sp[1:ds:end, :]), dims = 1)
     end
     
 
-    return y
+    return @view(y[1:ds:end, :])
+end
+
+function applyComplexFilterbank!(tfd, s, fb; forwards_backwards = true, tfd2 = nothing)
+    #newNumChannels = size(fb.cfs, 1)
+    #y = Matrix{ComplexF32}(undef, length(s), newNumChannels)
+
+    Threads.@threads for j in axes(fb.cfs, 1)
+       DSP.filt!(@view(tfd[:, j]), fb.filters[j], s)
+    
+    end
+
+    if forwards_backwards
+        tfd2 .= real.(tfd) 
+        reverse!(tfd2, dims = 1)
+        Threads.@threads for j in axes(fb.cfs, 1)
+            #x = DSP.filt(fb.filters[j], splitAudio[end:-1:1, j])
+            #splitAudio[:, j] = x[end:-1:1]
+            DSP.filt!(@view(tfd[:, j]), fb.filters[j], @view(tfd2[:, j]))
+        end
+
+        reverse!(tfd, dims = 1)
+    end
+    
+
+    return tfd
 end
 
 

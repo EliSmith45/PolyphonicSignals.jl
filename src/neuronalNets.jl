@@ -3,12 +3,13 @@
 
 
 module NeuronalNets
-include("./TimeFrequencyTools.jl")
-using .TimeFrequencyTools
+#include("./TimeFrequencyTools.jl")
+#using .TimeFrequencyTools
 
 
-using LinearAlgebra, CUDA
-export lca_iir, lca_iir2
+using LinearAlgebra#, Peaks, CUDA
+#export hard_threshold!, Dnn, DnnLateral1, DnnInput3, DnnInput, DnnLateral
+
 #Locally competitive algorithm for highly efficient biologically-plausible sparse coding:
 #
 # Kaitlin L. Fair, Daniel R. Mendat, Andreas G. Andreou, Christopher J. Rozell,
@@ -28,7 +29,226 @@ export lca_iir, lca_iir2
 # the audio sample rate is high (e.g. fs > 20kHz)
 # returns sparse code A, representing a highly sparse time frequency distribution with implicit total 
 # variation minimization. 
-function hard_threshold!(x::Vector{T}, vals::Vector{T}, threshold::Number) where T <: Real
+
+
+mutable struct LiquidRnn12{T} #block-sparse matrix
+    W0::Matrix{T} #input weights
+    W1::Matrix{T} #recurrent weights
+    bw::Array{T} #weight matrix bias
+    b::Array{T} #recurrent layer biases
+    τ::T #recurrent layer biases
+
+    U::Array{T}
+    A::Array{T}
+
+    delta::T
+end
+
+function LiquidRnn12(neurons, n_observations, T = Float32; W0 = rand(T, neurons[2], neurons[1]), W1 = rand(T, neurons[2], neurons[2]), bw = rand(T, neurons[2], n_observations), b = rand(T, neurons[2], n_observations), τ = .010f0, delta = .01)
+    U = zeros(T, neurons[2], n_observations)
+    A = copy(U)
+    LiquidRnn12{T}(W0, W1, bw, b, τ, U, A, delta)
+end
+
+using Flux
+
+function (m::LiquidRnn12)(x)
+    m.A .=  tanh.((m.W1 * m.U) .+ (m.W0 * x) .+ m.b) 
+    m.U .= (m.U .+ (m.delta .* m.A .* m.bw) ) ./ (1 .+ (m.delta .* ((1 / m.τ) .+ m.A)))
+    hard_threshold!(m.U, copy(m.U), 0.0f0)
+end
+
+
+a= LiquidRnn12((500, 500), 10000)
+x = rand(Float32, 500, 10000)
+@time a(x)
+a.U
+
+
+
+a= Lca1((500, 500), 10000; λ = .01, τ = .01)
+x = rand(Float32, 500, 10000)
+@time a(x)
+a.U
+
+mutable struct Lca1{T} #block-sparse matrix
+    W::Matrix{T}
+    U::Array{T}
+    A::Array{T}
+
+    λ::T
+    τ::T
+
+
+end
+
+function Lca1(neurons, n_observations, T = Float32; W = rand(T, neurons[2], neurons[1]), λ = .01, τ = .01)
+    
+ 
+    U = zeros(T, neurons[2], n_observations)
+    A = copy(U)
+    Lca1{T}(W, U, A, λ, τ)
+end
+function (m::Lca1)(x)
+    m.U .+= m.τ .* ((m.W * m.A) .- m.U .+ x)
+    hard_threshold!(m.A, m.U, m.λ)
+end
+
+
+
+a= Lca1((9, 9), 10; λ = .01, τ = .01)
+x = rand(Float32, 9, 10)
+a(x)
+a.U
+
+function initW(neurons, linked, T)
+    W = [[convert.(T, [0 0 ; 0 0]) for i in eachindex(neurons)] for i in eachindex(neurons)]#zeros(T, blockdims..., dims...)
+    for j in eachindex(neurons)
+        for i in eachindex(neurons)
+            if linked[j][i]
+                W[j][i] = rand(T, (neurons[j], neurons[i]))
+            else
+                W[j][i] = 0
+            end
+        end
+    end
+    return W
+end
+
+
+
+function Dnn(neurons, n_observations, T = Float32; W = nothing, linked = nothing, λ = repeat([.01f0], inner = length(neurons)), τ = repeat([.01f0], inner = length(neurons)))
+    
+  
+    if isnothing(linked)
+        linked = [zeros(Bool, length(neurons)) for i in eachindex(neurons)]
+        
+        for j in eachindex(neurons)
+            for i in eachindex(neurons)
+                if abs(i - j) <= 1
+                    linked[j][i] = true
+                end
+                
+            end
+        end
+        
+    end
+
+    
+
+    
+
+    if isnothing(W)
+        W = initW(neurons, linked, T)
+        
+    end
+  
+   
+   
+   # dU = [zeros(T, neurons[i], n_observations) for i in eachindex(neurons)]
+    U = [zeros(T, neurons[i], n_observations) for i in eachindex(neurons)]
+    A = [zeros(T, neurons[i], n_observations) for i in eachindex(neurons)]
+
+  
+    Dnn{T}(W, linked,  U, A, λ, τ)
+ 
+end
+
+function (m::Dnn)()
+   
+    @views for j ∈ eachindex(m.W)
+        m.U[j] .+= m.τ[j] .* ((m.W[j]' * m.A).- m.U[j] )
+      
+    end
+
+    
+    @views for j ∈ 2:length(m.A)
+        hard_threshold!(m.A[j], m.U[j], m.λ[j]) 
+    end
+end
+
+function (m::Dnn)(x)
+    m.A[1] .= x
+end
+
+
+
+
+
+
+
+
+
+mutable struct Dnn{T} #block-sparse matrix
+    W::Vector{Vector}
+    linked::Vector{Vector{Bool}}
+
+   
+    #dU::Array{Array{T}}
+    U::Array{Array{T}}
+    A::Array{Array{T}}
+
+    λ::Array{T}
+    τ::Array{T}
+
+
+end
+
+
+function initW(neurons, linked, T)
+    W = [[convert.(T, [0 0 ; 0 0]) for i in eachindex(neurons)] for i in eachindex(neurons)]#zeros(T, blockdims..., dims...)
+    for j in eachindex(neurons)
+        for i in eachindex(neurons)
+            if linked[j][i]
+                W[j][i] = rand(T, (neurons[j], neurons[i]))
+            else
+                W[j][i] = 0
+            end
+        end
+    end
+    return W
+end
+
+
+
+function Dn(neurons, n_observations, T = Float32; W = nothing, linked = nothing, λ = repeat([.01f0], inner = length(neurons)), τ = repeat([.01f0], inner = length(neurons)))
+    
+  
+    if isnothing(linked)
+        linked = [zeros(Bool, length(neurons)) for i in eachindex(neurons)]
+        
+        for j in eachindex(neurons)
+            for i in eachindex(neurons)
+                if abs(i - j) <= 1
+                    linked[j][i] = true
+                end
+                
+            end
+        end
+        
+    end
+
+    
+
+    
+
+    if isnothing(W)
+        W = initW(neurons, linked, T)
+        
+    end
+  
+   
+   
+   # dU = [zeros(T, neurons[i], n_observations) for i in eachindex(neurons)]
+    U = [zeros(T, neurons[i], n_observations) for i in eachindex(neurons)]
+    A = [zeros(T, neurons[i], n_observations) for i in eachindex(neurons)]
+
+  
+    Dnn{T}(W, linked,  U, A, λ, τ)
+ 
+end
+
+function hard_threshold!(x::Array{T}, vals::Array{T}, threshold::Number) where T <: Real
    
     for i in eachindex(vals)
         if vals[i] < threshold
@@ -39,236 +259,27 @@ function hard_threshold!(x::Vector{T}, vals::Vector{T}, threshold::Number) where
     end
 end
 
-function hard_threshold!(x::Vector{T}, vals::Vector{T}, threshold::Number) where T <: Complex
+
+
+
+function (m::Dnn)()
    
-    for i in eachindex(vals)
-        if mag(vals[i]) < threshold
-            x[i] = 0
-        else
-            x[i] = vals[i]
-        end
+    @views for j ∈ eachindex(m.W)
+        m.U[j] .+= m.τ[j] .* ((m.W[j]' * m.A).- m.U[j] )
+      
+    end
+
+    
+    @views for j ∈ 2:length(m.A)
+        hard_threshold!(m.A[j], m.U[j], m.λ[j]) 
     end
 end
 
-
-
-using Peaks
-###### Current best implementation
-function lca_iir2(X::Matrix{T}, G::Matrix{T};  τ = .01, threshold = .03, iters = 3, save_every = 1) where T <: Real
-
-    B = permutedims(X)
-    G[diagind(G)] .= 0
-    G = permutedims(G)
-    tr = threshold * maximum(B)
-    snapshots = div(size(B, 2), save_every) 
-    A = zeros(eltype(B), size(B, 1), snapshots) #activation of each neuron, i.e. the resulting sparse code
-    ut = zeros(eltype(B), size(B, 1)) 
-    inhibitions = copy(ut)
-    activeSet = Int64[]
-
-    for t in axes(B, 2) 
-        
-        for iter in 1:iters
-    
-          #equivalent to: ut .+= τ .* (@view(B[:, t]) .- ut .- (G * at))
-          mul!(inhibitions, G[:, activeSet], ut[activeSet])
-          axpby!(τ, @view(B[:, t]) .- inhibitions, 1 - τ, ut)
-          #LinearAlgebra.gemv!(ut, 'N', G[:, activeSet], ut[activeSet], -τ, 1 - τ)
-          #axpy!(τ, @view(B[:, t]), ut)
-          
-          
-          peaks = findmaxima(ut)
-          activeSet = peaks[1][findall(x -> x > tr, peaks[2])]
-          #findall(x -> x > tr, ut)
-            
-        end
-       
-        if (t % save_every) == 0
-            A[activeSet, div(t, save_every)] .= @view(ut[activeSet])
-        end
-   
-    end
-
-    G[diagind(G)] .= 1
-
-    return permutedims(A)
-
+function (m::Dnn)(x)
+    m.A[1] .= x
 end
 
 
-
-
-function lca_iir2(X::Matrix{T}, G::Matrix{T}, phaseShift;  τ = .01, threshold = .03, iters = 3, save_every = 1) where T <: Complex
-
-    B = permutedims(X)
-    G2 = copy(G)
-    G2[diagind(G2)] .= 0
-    G2 = permutedims(G2)
-    tr = threshold * maximum(mag.(B))
-    snapshots = div(size(B, 2), save_every) 
-    A = zeros(eltype(B), size(B, 1), snapshots) #activation of each neuron, i.e. the resulting sparse code
-    ut = zeros(eltype(B), size(B, 1)) 
-    rt = copy(ut)
-    inhibitions = copy(ut)
-    activeSet = Int64[]
-
-    for t in axes(B, 2) 
-        
-        for iter in 1:iters
-    
-            #equivalent to: ut .+= τ .* (@view(B[:, t]) .- ut .- (G * at))
-            mul!(inhibitions, G2[:, activeSet], ut[activeSet])
-            rt .= @view(B[:, t]) .- inhibitions
-            axpby!(τ, rt, 1 - τ, ut)
-            #LinearAlgebra.gemv!(ut, 'N', G[:, activeSet], ut[activeSet], -τ, 1 - τ)
-            #axpy!(τ, @view(B[:, t]), ut)
-            
-            peaks = findmaxima(mag.(ut))
-            activeSet = peaks[1][findall(x -> x > tr, peaks[2])]
-           
-        end
-       
-       
-        ut[activeSet] .*= phaseShift[activeSet]
-            
-
-        if (t % save_every) == 0
-            A[activeSet, div(t, save_every)] .= @view(ut[activeSet])
-        end
-   
-    end
-
-   
-
-    return permutedims(A)
-
-end
-
-
-function lca_iir(X::Matrix{T}, G::Matrix, phaseShift;  τ = .01, threshold = .03, iters = 3, save_every = 1, delta = .01) where T <: Complex
-
-    
-    B = permutedims(X)
-    G2 = permutedims(G)
-    G2[diagind(G2)] .= 0
-    
-    tr = threshold * maximum(mag.(B))
-    snapshots = div(size(B, 2), save_every) 
-    A = zeros(eltype(B), size(B, 1), snapshots) #activation of each neuron, i.e. the resulting sparse code
-    #R = copy(A)
-    residual_norm = zeros(Float64, snapshots)
-    ut = zeros(eltype(B), size(B, 1)) 
-    last_ut = copy(ut)
-    rt = copy(ut)
-    inhibitions = copy(ut)
-    activeSet = Int64[]
-
-    residual_norm[1] = 1.1
-    residual_norm[2] = 1.0
-
-   
-    for t in axes(B, 2) 
-        iter = 1
-        converged = false
-        diff = 1.0
-        while (iter <= iters) && !converged 
-           
-            mul!(inhibitions, @view(G2[:, activeSet]), @view(ut[activeSet]))
-            axpby!(τ, @view(B[:, t]) .- inhibitions, 1 - τ, ut)
-            
-            diff = norm(last_ut .- ut) / norm(ut)
-            last_ut .= copy(ut)
-            activeSet = findall(x -> x > tr, mag.(ut))
-            
-            iter +=1 
-    
-            converged = (diff < delta)
-            
-        end
-        
-
-       
-        #at[activeSet] .*= phaseShift[activeSet]
-        ut[activeSet] .*= phaseShift[activeSet]
-            
-
-
-        if (t % save_every) == 0
-            A[activeSet, div(t, save_every)] .= @view(ut[activeSet])
-            rt .= @view(B[:, t]) .- inhibitions
-            rt[activeSet] .-= @view(ut[activeSet])
-            residual_norm[div(t, save_every)] = norm(rt)
-            #R[:, div(t, save_every)] .= (D[:, activeSet]) * @view(ut[activeSet])
-        end
-   
-    end
-
-    #G2[diagind(G)] .= 1
-
-    return permutedims(mag.(A)), residual_norm#permutedims(mag.(R))
-
-end
-
-
-
-function lca_iir(X::Matrix{T}, G::Matrix{T}, phaseShift;  τ = .01, threshold = .03, iters = 3, save_every = 1) where T <: Complex
-
-    Xp = permutedims(X)
-    B = copy(Xp)
-    D = copy(G)
-    foreach(normalize!, eachcol(D))
-    B = permutedims(D) * B 
-    G2 = D * permutedims(D)
-
-   
-    G2[diagind(G2)] .= 0
-    
-    #return G2
-
-    tr = threshold * maximum(mag.(B))
-    snapshots = div(size(B, 2), save_every) 
-    A = zeros(eltype(B), size(B, 1), snapshots) #activation of each neuron, i.e. the resulting sparse code
-    R = copy(A)
-    residual_norm = zeros(Float64, iters, size(B, 2))
-    ut = zeros(eltype(B), size(B, 1)) 
-    rt = copy(ut)
-    inhibitions = copy(ut)
-    activeSet = Int64[]
-
-    for t in axes(B, 2) 
-        
-        for iter in 1:iters
-    
-            #equivalent to: ut .+= τ .* (@view(B[:, t]) .- ut .- (G * at))
-            mul!(inhibitions, G2[:, activeSet], ut[activeSet])
-            axpby!(τ, @view(B[:, t]) .- inhibitions, 1 - τ, ut)
-            
-            mul!(rt, D[:, activeSet], ut[activeSet])
-           
-            rt .= mag.(@view(Xp[:, t])) .- mag.(rt)
-
-            residual_norm[iter, t] = norm(rt) / norm(@view(B[:, t]))
-            peaks = findmaxima(mag.(ut))
-            activeSet = peaks[1][findall(x -> x > tr, peaks[2])]
-           
-        end
-       
-       
-        ut[activeSet] .*= phaseShift[activeSet]
-            
-
-        if (t % save_every) == 0
-            A[activeSet, div(t, save_every)] .= @view(ut[activeSet])
-            #R[:, div(t, save_every)] .= (D[:, activeSet]) * @view(ut[activeSet])
-        end
-   
-    end
-
-    #G2[diagind(G)] .= 1
-
-    return permutedims(mag.(A)), residual_norm#permutedims(mag.(R))
-
-end
 
 end
 

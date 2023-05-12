@@ -129,7 +129,7 @@ function createSignalFromInstFA(frequencies, amplitudes, fs)
     song = sampleCosine(frequencies, amplitudes, fs)
     s = AudioRecord([0.0 0.0; 0.0 0.0], song, fs, round(length(song)/fs, digits = 3), 1)
     
-    return s
+    return song
 end
 
 
@@ -145,16 +145,21 @@ function sampleCosine(frequencies, amplitudes, fs)
 
     return song
 end
-function createEnvelope(InstVals, linModRate, errorRate, duration, fs)
+function createEnvelope(InstVals; linModRate, modulationFreq, modulationAmp, errorRate, duration, fs)
     envelope = zeros(Int(round(duration*fs)), length(InstVals))
-    
+    ef = zeros(size(envelope, 1))
+    linMod = zeros(size(envelope, 1))
+    sinusoidalMod = zeros(size(envelope, 1))
     #linModRate ./= fs #change from inverse seconds to inverse samples
     errorRate /= fs
+    modulationFreq ./= fs
 
     for j in eachindex(InstVals)
-        ef = cumsum(rand(Normal(0, errorRate), size(envelope, 1)))
-        linMod = cumsum(repeat([linModRate[j]/fs], inner =length(ef)))
-        @view(envelope[:, j]) .= repeat([InstVals[j]], inner = length(ef)) .+ linMod .+ ef
+      
+        ef .= cumsum(rand(Normal(0, errorRate), size(envelope, 1)))
+        linMod .= cumsum(repeat([linModRate[j]/fs], inner =length(ef)))
+        sinusoidalMod .= (modulationAmp[j] * InstVals[j]) .* sinpi.((2 * modulationFreq[j]) .* (1:size(envelope, 1)))
+        @view(envelope[:, j]) .= repeat([InstVals[j]], inner = length(ef)) .+ linMod .+ ef .+ sinusoidalMod
     end
 
     return envelope
@@ -735,21 +740,22 @@ end
 
 
 #get pairwise frequency responses between each filter (frequency response of filter i at the center frequency of filter j)
-function freqresponses(fb, fs)
-    freqr = zeros(ComplexF32, length(fb.filters), length(fb.filters))
+function freqresponses(fb, fs; interp = 1)
+
+    numFreqs = size(fb.filters, 1) * interp
+    frs = erbToHz.(collect(range(fb.cfs[1, 1], fb.cfs[end, 1], length = numFreqs))) .* ((2 * π) / fs)
+    freqr = zeros(ComplexF32, numFreqs, length(fb.filters))
     
     Threads.@threads for j in axes(freqr, 2)
-        freqr[:, j] .= freqresp(fb.filters[j], fb.cfs[:, 2] .* (2 * π) ./ fs)
+        freqr[:, j] .= freqresp(fb.filters[j], frs)
         #freqr[j, j] = 0 
     end
 
-    #probs = copy(freqr)
-    #for i in 2:order
-    #    freqr[:, j] 
+    
+    phaseShifts = conj.(cispi.(frs))
+    frResp = mag2.(freqr)
 
-    #end
-
-    return freqr
+    return permutedims(frResp), phaseShifts
 end
 
 
